@@ -1,0 +1,25 @@
+# Mamba Motion Matching (MMM) -- Phase 0 requirements
+#
+# Phase 0 is the classic KNN motion matching baseline: BVH loading, forward
+# kinematics, the 27 number matching features, the two databases, cKDTree
+# search, spring damper trajectory, inertialization, and the raylib viewer.
+# No torch is needed until Phase 1, and mamba-ssm is not needed at all
+# (Phase 1 uses a pure PyTorch Mamba).
+#
+# Target environment: the conda env `llm`, Python 3.10.19.
+# Install with that env's pip:
+#
+#   C:/ProgramData/Anaconda3/envs/llm/python.exe -m pip install -r requirements.txt
+
+# --- core ---------------------------------------------------------------
+# numpy is capped below 2.0 on purpose: the env already has torch 2.1.0,
+# which was built against the numpy 1.x ABI and breaks on numpy 2.x.
+numpy>=1.24,<2.0
+scipy>=1.10            # cKDTree, for the KNN search over the Matching Database
+
+# raylib-python-cffi, the Python binding used by GenoViewPython.
+# Pulls in cffi. Imported as `pyray` (or `raylib` for the C-style API).
+raylib>=5.0,<6.0
+
+# --- development --------------------------------------------------------
+pytest>=7.4            # tests/test_fk.py, tests/test_features.py

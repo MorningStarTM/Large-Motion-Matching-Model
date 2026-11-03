@@ -1,0 +1,3 @@
+# AMASS, optional Phase 1 pretraining only (plan section 15).
+# To fill in: chosen subsets with their licence and citation, SMPL+H model path,
+# resampling target 60 fps, retargeting joint map, cleaning thresholds.

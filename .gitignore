@@ -218,3 +218,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ----------------------------------------------------------------------------
+# MMM project
+# ----------------------------------------------------------------------------
+
+# Motion data and derived artefacts: never in git (plan section 8)
+# Leading slash anchors this to the repo root, so it does not also match
+# the mmm/data/ source package.
+/data/
+*.bvh
+*.fbx
+*.c3d
+*.npz
+*.npy
+
+# Research plan, build phases and decision records: kept local
+/docs/
+
+# Runs: checkpoints, logs, teacher rollouts, DAgger datasets
+runs/*
+!runs/README.md
+*.pt
+*.ckpt
+*.onnx
+*.bin
+
+# C++ build
+engine/build/
+*.o
+*.pyd
+*.a

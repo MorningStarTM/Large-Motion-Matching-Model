@@ -1,0 +1,3 @@
+# Small transformer backbone baseline.
+# To fill in: layers, heads, context window lengths to measure at, since the
+# point is that per frame cost grows with history.

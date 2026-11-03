@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmm"
+version = "0.0.1"
+description = "Mamba Motion Matching (MMM): real time character animation that learns from an editable motion database, so new clips work without retraining."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "ErnestBeckham" }]
+keywords = [
+    "motion-matching",
+    "character-animation",
+    "mamba",
+    "state-space-model",
+    "reinforcement-learning",
+    "game-ai",
+    "motion-capture",
+    "pytorch",
+]
+
+# Phase 0 only: BVH loading, features, KNN search, spring damper,
+# inertialization and the raylib viewer. Later phases add their own
+# dependencies as optional extras when that phase starts.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",   # cKDTree for the KNN search
+    "raylib>=5.0",   # raylib-python-cffi, for the GenoViewPython viewer
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["mmm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

@@ -1,0 +1,2 @@
+# Full pose output against residual output (plan section 4.4).
+# Proves the value of retrieve then refine. Same data, same phases, two heads.

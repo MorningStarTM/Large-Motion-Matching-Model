@@ -1,0 +1,3 @@
+# Phase 2: distil from the KNN teacher. SFT plus DAgger.
+# To fill in: teacher rollout hours, synthetic joystick mix, loss weights,
+# number of DAgger rounds, dataset mix across rounds, starting checkpoint.

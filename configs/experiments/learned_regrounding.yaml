@@ -1,0 +1,3 @@
+# Fixed 10 frame retrieval against learned retrieval timing.
+# Plan section 10.3, a novel contribution. To fill in: search cost term,
+# minimum interval between searches, threshold, and the fixed interval baseline.

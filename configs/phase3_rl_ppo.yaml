@@ -1,0 +1,4 @@
+# Phase 3: RL polish with KNN in the loop, PPO variant.
+# To fill in: reward weights alpha, beta, gamma, lambda; PPO clip, epochs,
+# batch; episode length; termination conditions; render interval for the visual
+# inspection the plan requires.

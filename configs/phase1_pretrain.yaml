@@ -1,0 +1,4 @@
+# Phase 1: pretrain on raw mocap. Supervised next pose prediction.
+# To fill in: datasets, window length, loss weights (set so each term has roughly
+# equal magnitude), retrieval dropout rate, leave one clip out on, scheduled
+# sampling schedule, optimizer, device.

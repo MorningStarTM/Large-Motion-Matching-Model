@@ -1,0 +1,5 @@
+# Phase 3: RL polish with KNN in the loop, direct gradient variant.
+# Backpropagation through the rollout, available because FK and every reward
+# term are differentiable in a kinematic world.
+# To fill in: horizon H (for example 32 frames), same reward weights as the PPO
+# config so the two are comparable.

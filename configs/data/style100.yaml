@@ -1,0 +1,4 @@
+# 100STYLE, retargeted to Geno. 100 locomotion styles, 4M+ frames. CC BY 4.0.
+# To fill in: paths, the 90 training styles, and the 10 held out styles named
+# explicitly (plan section 7). The held out ten enter neither pretraining nor
+# the KB until the editability experiment.

@@ -1,0 +1,4 @@
+# Phase 0 KNN motion matching teacher.
+# To fill in: K (about 4 for the model's context, 1 for the teacher's own
+# playback), search interval (10 frames), feature weights, spring damper half
+# lives, inertialization blend time, search backend.

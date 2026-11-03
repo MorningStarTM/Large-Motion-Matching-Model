@@ -1,0 +1,5 @@
+# The main claim: hold out 10 styles from training, add them to the KB only,
+# and the character performs them. Proves no retraining needed.
+# To fill in: the ten styles, the joystick sequences that call for each one, the
+# with KB against without KB comparison, and the assertion that no held out clip
+# was in training.

@@ -1,0 +1,3 @@
+# GRU backbone baseline, required by plan section 4.5.
+# Size it to a comparable parameter and multiply add count per frame, so the
+# comparison is about architecture rather than capacity.
