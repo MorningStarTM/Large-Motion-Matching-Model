@@ -58,6 +58,12 @@ class WindowDataset:
         clips: restrict to these clip names. Used to hold out styles and to
             split train from validation.
         seed: for the window order when shuffling is done here.
+        use_retrieval: whether to retrieve candidates at all. False is the
+            Phase 1 setting: pre-training learns the motion prior from
+            (joystick, previous pose) alone, so the candidate block is not
+            built and the whole retrieval precompute -- seven minutes on
+            264,000 rows -- is skipped. Samples then carry no `candidates` or
+            `mask` key.
         cache_dir: where to keep the precomputed retrieval. The precompute
             costs about seven minutes on 264,000 rows and depends only on the
             database and on `k`, `leave_one_clip_out` and `retrieval_interval`,
@@ -79,6 +85,7 @@ class WindowDataset:
         index: KnnIndex | None = None,
         seed: int = 0,
         cache_dir: str | None = None,
+        use_retrieval: bool = True,
     ):
         if database.matching.normalization is None:
             raise ValueError("database normalization has not been fitted")
@@ -119,8 +126,12 @@ class WindowDataset:
             )
 
         self.cache_dir = cache_dir
+        self.use_retrieval = use_retrieval
         self._contacts = self._compute_contacts()
-        self._candidate_next, self._candidate_mask = self._load_or_precompute()
+        if use_retrieval:
+            self._candidate_next, self._candidate_mask = self._load_or_precompute()
+        else:
+            self._candidate_next = self._candidate_mask = None
 
     # -- contacts ---------------------------------------------------------
 
@@ -261,25 +272,26 @@ class WindowDataset:
             ).stop
         ]
 
-        # Hold each retrieval for `retrieval_interval` frames, mirroring the
-        # runtime's 10 frame search. Retrieving fresh every frame would train
-        # the model on information it will not have.
-        anchors = base + (np.arange(self.window) // self.retrieval_interval) * (
-            self.retrieval_interval
-        )
-        held = self._candidate_next[anchors]
-        candidates = poses[held]
-        mask = self._candidate_mask[anchors]
-
-        return {
+        sample = {
             "joystick": joystick.astype(np.float32),
             "previous_pose": poses[rows].astype(np.float32),
-            "candidates": candidates.astype(np.float32),
-            "mask": mask.astype(np.float32),
             "target": poses[rows + 1].astype(np.float32),
             "contacts": self._contacts[rows + 1].astype(np.float32),
             "clip_id": np.int64(clip_id),
         }
+
+        if self.use_retrieval:
+            # Hold each retrieval for `retrieval_interval` frames, mirroring
+            # the runtime's 10 frame search. Retrieving fresh every frame would
+            # train the model on information it will not have.
+            anchors = base + (np.arange(self.window) // self.retrieval_interval) * (
+                self.retrieval_interval
+            )
+            held = self._candidate_next[anchors]
+            sample["candidates"] = poses[held].astype(np.float32)
+            sample["mask"] = self._candidate_mask[anchors].astype(np.float32)
+
+        return sample
 
     def _view(self, windows) -> "WindowDataset":
         """A dataset over a subset of the windows, sharing this one's arrays.

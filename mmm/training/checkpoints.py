@@ -38,6 +38,8 @@ from safetensors.torch import load_file, save_file
 __all__ = [
     "save_checkpoint",
     "load_checkpoint",
+    "load_backbone",
+    "extend_input_layer",
     "read_metadata",
     "CHECKPOINT_SUFFIX",
     "LEGACY_SUFFIX",
@@ -225,3 +227,92 @@ def load_checkpoint(
         optimizer.load_state_dict(_rebuild_optimizer(tensors, header))
 
     return metadata
+
+
+# ---------------------------------------------------------------- phase handoff
+
+
+def load_backbone(path: str, policy, strict: bool = True) -> dict:
+    """Load only the backbone from a checkpoint, leaving the adapters alone.
+
+    The backbone is 1,752,320 of 1,989,273 parameters -- 88% of the model --
+    and it is the part that holds the motion dynamics. The input and output
+    layers are per phase and per skeleton adapters (plan section 15.3): the
+    input width changes between phases because the inputs do, and the output
+    width changes between skeletons because `pose_dim = n_joints * 6 + 7`.
+
+    So this is the transfer path: train the backbone once, carry it forward,
+    and relearn only the 12% that has to change.
+
+    Returns the checkpoint metadata.
+    """
+    metadata = read_metadata(path)
+
+    if path.endswith(LEGACY_SUFFIX):
+        warnings.warn(f"{path} is a legacy pickle checkpoint.", stacklevel=2)
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        tensors = {f"{_POLICY_PREFIX}{k}": v for k, v in blob["policy"].items()}
+    else:
+        tensors = load_file(path, device="cpu")
+
+    prefix = f"{_POLICY_PREFIX}backbone."
+    weights = {
+        key[len(prefix) :]: value
+        for key, value in tensors.items()
+        if key.startswith(prefix)
+    }
+    if not weights:
+        raise ValueError(f"{path} contains no backbone tensors")
+
+    saved_d_model = (metadata.get("architecture") or {}).get("d_model")
+    current_d_model = getattr(policy, "d_model", None)
+    if strict and saved_d_model is not None and current_d_model is not None:
+        if saved_d_model != current_d_model:
+            raise ValueError(
+                f"{path} has d_model={saved_d_model} but this policy has "
+                f"{current_d_model}. The backbone cannot transfer across a "
+                "width change; pass strict=False only if you know why."
+            )
+
+    policy.backbone.load_state_dict(weights, strict=strict)
+    return metadata
+
+
+def extend_input_layer(old_weight, old_bias, new_in_features: int):
+    """Widen an input layer's weight, zero-filling the new columns.
+
+    `nn.Linear` holds its weight as `(out_features, in_features)`, so widening
+    the input adds *columns*.
+
+    The new columns are zero, not random, and that is the whole point. Phase 1
+    trains on `joystick + previous_pose`; Phase 2 adds the retrieved candidates
+    on the end. Zero-filling means that on Phase 2's first step the candidate
+    block contributes exactly nothing and the model reproduces the finished
+    Phase 1 model bit for bit. It then learns to use retrieval from a known
+    good starting point rather than from a disturbed one.
+
+    Random initialisation instead would inject noise through 608 new inputs
+    into a model whose recurrence was tuned without them, and the first thing
+    Phase 2 would have to do is recover the prior it was given.
+
+    This relies on the two input layouts sharing a prefix, which
+    `IoSpec.block_offsets` guarantees: joystick and previous_pose occupy
+    `0:163` whether or not retrieval is in use.
+
+    Returns:
+        `(weight, bias)` for the wider layer. The bias is unchanged, since it
+        is per output and the outputs have not changed.
+    """
+    out_features, old_in = old_weight.shape
+    if new_in_features < old_in:
+        raise ValueError(
+            f"cannot extend {old_in} inputs to {new_in_features}: that is "
+            "narrower. Widening is lossless; narrowing is not, and would need "
+            "a decision about which columns to drop."
+        )
+
+    weight = torch.zeros(
+        (out_features, new_in_features), dtype=old_weight.dtype, device=old_weight.device
+    )
+    weight[:, :old_in] = old_weight
+    return weight, old_bias.clone()

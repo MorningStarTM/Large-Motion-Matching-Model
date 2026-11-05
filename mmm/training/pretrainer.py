@@ -38,7 +38,17 @@ import torch
 from mmm.data.database import MotionDatabase
 from mmm.models.heads import ResidualHead
 from mmm.models.policy import MmmPolicy
+from mmm.training.callbacks import (
+    Callback,
+    CallbackList,
+    CSVLogger,
+    EarlyStopping,
+    LearningRateLogger,
+    ProgressLogger,
+    TensorBoard,
+)
 from mmm.training.checkpoints import load_checkpoint, save_checkpoint
+from mmm.training.schedules import build_schedule
 from mmm.training.losses import LossWeights, PoseLoss
 
 __all__ = ["PreTrainerConfig", "PreTrainer"]
@@ -89,6 +99,62 @@ class PreTrainerConfig:
     loss_weights: LossWeights = field(default_factory=LossWeights)
     calibrate_weights: bool = True
 
+    # -- learning rate schedule ------------------------------------------
+    # "cosine" with a one epoch warmup. Constant is available for an ablation
+    # but is a poor default at both ends of a run: see mmm/training/schedules.
+    lr_schedule: str = "cosine"
+    warmup_epochs: float = 1.0
+    min_lr_factor: float = 0.05
+
+    # -- selection and stopping ------------------------------------------
+    # Which metric decides `best.safetensors` and early stopping.
+    #
+    # "val_rollout_total" -- free running -- rather than "val_total", because
+    # Phase 1's deliverable is a drift resistant motion prior and the teacher
+    # forced loss cannot see drift: it hands the model the true previous pose
+    # every frame. Falls back to val_total, then train_total, if absent.
+    monitor: str = "val_rollout_total"
+    min_delta: float = 0.0
+    # Epoch from which `monitor` starts deciding `best` and early stopping.
+    # None means `scheduled_sampling_start`.
+    #
+    # Measured on a 3 epoch run: under pure teacher forcing the free running
+    # loss got *worse* every epoch (2.688 -> 3.837 -> 3.643) while the teacher
+    # forced loss halved (1.002 -> 0.602 -> 0.521). That is exposure bias, and
+    # it is expected -- nothing is training the free running regime until
+    # scheduled sampling engages. Letting the monitor act before then picks the
+    # least trained epoch as "best" and can early stop the run before the
+    # mechanism meant to fix drift has done anything at all.
+    monitor_start_epoch: int | None = None
+
+    # -- logging ----------------------------------------------------------
+    tensorboard: bool = True
+    csv_log: bool = True
+    progress_every: int = 25
+
+    @property
+    def resolved_monitor_start(self) -> int:
+        if self.monitor_start_epoch is not None:
+            return self.monitor_start_epoch
+        return max(self.scheduled_sampling_start, 1)
+
+    def resolved_monitor(self, logs: dict) -> str:
+        """The monitored key, falling back if it was not produced.
+
+        A monitor that silently never appears would disable early stopping and
+        make every epoch look like the best one, so the fallback is explicit
+        and reported once.
+        """
+        for candidate in (self.monitor, "val_total", "train_total"):
+            if candidate in logs:
+                if candidate != self.monitor:
+                    print(
+                        f"[monitor] {self.monitor!r} not produced; "
+                        f"falling back to {candidate!r}"
+                    )
+                return candidate
+        raise ValueError(f"no usable monitor in logs: {sorted(logs)}")
+
     def as_dict(self) -> dict:
         out = {
             key: getattr(self, key)
@@ -105,6 +171,13 @@ class PreTrainerConfig:
                 "amp",
                 "log_every",
                 "calibrate_weights",
+                "lr_schedule",
+                "warmup_epochs",
+                "min_lr_factor",
+                "monitor",
+                "min_delta",
+                "monitor_start_epoch",
+                "rollout_eval_batches",
             )
         }
         out["loss_weights"] = self.loss_weights.as_dict()
@@ -153,6 +226,11 @@ class PreTrainer:
         )
         self.history: dict[str, list] = {}
         self._calibrated = False
+        self.start_epoch = 1
+        self.global_step = 0
+        self.schedule = None
+        self.steps_per_epoch = 0
+        self.callbacks = None
 
     # -- schedules --------------------------------------------------------
 
@@ -189,8 +267,10 @@ class PreTrainer:
         """
         joystick = batch["joystick"]
         previous = batch["previous_pose"]
-        candidates = batch["candidates"]
-        mask = batch["mask"]
+        # Absent in Phase 1: the dataset does not build a candidate block when
+        # retrieval is off, so the trainer must not require one.
+        candidates = batch.get("candidates")
+        mask = batch.get("mask")
 
         if sampling_probability <= 0.0:
             pose, contacts, _ = self.policy(
@@ -207,7 +287,11 @@ class PreTrainer:
             poses, contact_list = [], []
             for t in range(seq_len):
                 pose_t, contacts_t, state = self.policy.step(
-                    joystick[:, t], fed, candidates[:, t], mask[:, t], state
+                    joystick[:, t],
+                    fed,
+                    None if candidates is None else candidates[:, t],
+                    None if mask is None else mask[:, t],
+                    state,
                 )
                 poses.append(pose_t)
                 if contacts_t is not None:
@@ -226,7 +310,7 @@ class PreTrainer:
             contacts = torch.stack(contact_list, dim=1) if contact_list else None
 
         correction = None
-        if isinstance(self.policy.head, ResidualHead):
+        if isinstance(self.policy.head, ResidualHead) and candidates is not None:
             correction = ResidualHead.correction(pose, candidates, mask)
 
         return pose, contacts, correction
@@ -245,11 +329,18 @@ class PreTrainer:
         totals: dict[str, float] = {}
         n_batches = 0
 
-        for batch in loader:
+        grad_norm_total = 0.0
+
+        for index, batch in enumerate(loader):
             batch = self._batch_to_device(batch)
 
             if self.config.calibrate_weights and not self._calibrated:
                 self._calibrate(batch)
+
+            # Set the rate per step, not per epoch: an epoch is hundreds of
+            # steps, so a per-epoch schedule would jump the rate at an
+            # arbitrary point inside one.
+            lr = self._apply_lr()
 
             pose, contacts, correction = self._rollout(batch, probability, training=True)
             loss, terms = self.loss_fn(
@@ -262,17 +353,49 @@ class PreTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            # The norm before clipping, which is the diagnostic worth having:
+            # after clipping it is just `grad_clip` whenever anything is wrong.
             if self.config.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.grad_clip)
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        self.policy.parameters(), self.config.grad_clip
+                    )
+                )
+            else:
+                grad_norm = 0.0
+            grad_norm_total += grad_norm
+
             self.optimizer.step()
+            self.global_step += 1
 
             for name, value in terms.items():
                 totals[name] = totals.get(name, 0.0) + value
             n_batches += 1
 
+            if self.callbacks is not None:
+                self.callbacks.on_batch_end(
+                    index, {**terms, "lr": lr, "grad_norm": grad_norm}
+                )
+
         result = {name: value / max(n_batches, 1) for name, value in totals.items()}
         result["sampling_probability"] = probability
+        result["grad_norm"] = grad_norm_total / max(n_batches, 1)
+        result["lr"] = float(self.optimizer.param_groups[0]["lr"])
         return result
+
+    def _apply_lr(self) -> float:
+        """Write the scheduled rate onto the optimizer, and return it.
+
+        No schedule means the configured rate, untouched -- so calling
+        `train_epoch` directly, as the tests do, needs no schedule.
+        """
+        if self.schedule is None:
+            return float(self.optimizer.param_groups[0]["lr"])
+        lr = self.schedule(self.global_step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
 
     @torch.no_grad()
     def validate(self, loader) -> dict:
@@ -306,9 +429,15 @@ class PreTrainer:
             for name, value in terms.items():
                 totals[name] = totals.get(name, 0.0) + value
 
-            blanked = dict(batch)
-            blanked["candidates"] = torch.zeros_like(batch["candidates"])
-            blanked["mask"] = torch.zeros_like(batch["mask"])
+            if "candidates" in batch:
+                blanked = dict(batch)
+                blanked["candidates"] = torch.zeros_like(batch["candidates"])
+                blanked["mask"] = torch.zeros_like(batch["mask"])
+            else:
+                # Phase 1 has no retrieval to ablate, so the "without" pass is
+                # the same pass. The gain is then exactly zero by definition
+                # rather than by measurement, which is the honest answer.
+                blanked = batch
             ablated_pose, ablated_contacts, _ = self._rollout(blanked, 0.0, training=False)
             _, ablated_terms = self.loss_fn(
                 ablated_pose,
@@ -369,9 +498,12 @@ class PreTrainer:
             )
             with_retrieval += terms["total"]
 
-            blanked = dict(batch)
-            blanked["candidates"] = torch.zeros_like(batch["candidates"])
-            blanked["mask"] = torch.zeros_like(batch["mask"])
+            if "candidates" in batch:
+                blanked = dict(batch)
+                blanked["candidates"] = torch.zeros_like(batch["candidates"])
+                blanked["mask"] = torch.zeros_like(batch["mask"])
+            else:
+                blanked = batch
             ablated_pose, ablated_contacts, _ = self._rollout(blanked, 1.0, training=False)
             _, ablated_terms = self.loss_fn(
                 ablated_pose,
@@ -411,7 +543,9 @@ class PreTrainer:
 
     # -- the loop ---------------------------------------------------------
 
-    def fit(self, train_loader, val_loader=None, on_epoch_end=None) -> dict:
+    def fit(
+        self, train_loader, val_loader=None, on_epoch_end=None, callbacks=None
+    ) -> dict:
         """Train, with early stopping on validation loss.
 
         Args:
@@ -422,45 +556,141 @@ class PreTrainer:
         Returns:
             The history dict, also written to the checkpoint directory.
         """
-        best_metric = math.inf
-        best_epoch = 0
-        bad_epochs = 0
+        config = self.config
         self._write_manifest()
 
-        for epoch in range(1, self.config.epochs + 1):
-            started = time.time()
-            train_metrics = self.train_epoch(train_loader, epoch)
-            val_metrics = self.validate(val_loader) if val_loader is not None else None
+        # The schedule spans the actual run, so it is built here where the
+        # loader length is known rather than guessed in the config.
+        self.steps_per_epoch = len(train_loader)
+        self.schedule = build_schedule(
+            kind=config.lr_schedule,
+            base_lr=config.learning_rate,
+            epochs=config.epochs,
+            steps_per_epoch=self.steps_per_epoch,
+            warmup_epochs=config.warmup_epochs,
+            min_lr_factor=config.min_lr_factor,
+        )
 
-            self._record("train", train_metrics)
-            if val_metrics is not None:
-                self._record("val", val_metrics)
-            self._record("meta", {"epoch_seconds": time.time() - started})
+        stopper = EarlyStopping(
+            monitor=config.monitor,
+            patience=config.patience,
+            min_delta=config.min_delta,
+            start_epoch=config.resolved_monitor_start,
+        )
+        built = [LearningRateLogger(), stopper]
+        if config.csv_log:
+            built.append(CSVLogger(os.path.join(self.checkpoint_dir, "metrics.csv")))
+        if config.tensorboard:
+            built.append(TensorBoard(os.path.join(self.checkpoint_dir, "tb")))
+        if config.progress_every:
+            built.append(
+                ProgressLogger(every=config.progress_every, total=self.steps_per_epoch)
+            )
+        if on_epoch_end is not None:
+            # The old single-callable hook, kept working as a callback.
+            built.append(_LegacyEpochHook(on_epoch_end))
+        built.extend(callbacks or [])
 
-            metric = val_metrics["total"] if val_metrics else train_metrics["total"]
-            if metric < best_metric - 1e-9:
-                best_metric, best_epoch, bad_epochs = metric, epoch, 0
-                self.save(os.path.join(self.checkpoint_dir, "best.safetensors"), epoch=epoch)
-            else:
-                bad_epochs += 1
+        self.callbacks = CallbackList(built, trainer=self)
+        self.callbacks.on_train_begin(
+            {"config": config.as_dict(), "architecture": self.policy.describe()}
+        )
 
-            if epoch % self.config.log_every == 0:
-                self._log(epoch, train_metrics, val_metrics, time.time() - started)
+        best_metric = math.inf
+        best_epoch = 0
+        monitor_key = None
+        epoch = self.start_epoch
 
-            if on_epoch_end is not None:
-                on_epoch_end(epoch, train_metrics, val_metrics)
+        try:
+            for epoch in range(self.start_epoch, config.epochs + 1):
+                started = time.time()
+                self.callbacks.on_epoch_begin(epoch)
 
-            if bad_epochs >= self.config.patience:
-                print(
-                    f"[early stop] no improvement for {self.config.patience} epochs; "
-                    f"best epoch {best_epoch} at {best_metric:.6f}"
-                )
-                break
+                train_metrics = self.train_epoch(train_loader, epoch)
+                val_metrics = self.validate(val_loader) if val_loader is not None else None
 
-        self.save(os.path.join(self.checkpoint_dir, "last.safetensors"), epoch=epoch)
-        with open(os.path.join(self.checkpoint_dir, "history.json"), "w", encoding="utf-8") as handle:
-            json.dump(self.history, handle, indent=2)
+                self._record("train", train_metrics)
+                if val_metrics is not None:
+                    self._record("val", val_metrics)
+                self._record("meta", {"epoch_seconds": time.time() - started})
+
+                logs = {f"train_{k}": v for k, v in train_metrics.items()}
+                if val_metrics is not None:
+                    logs.update({f"val_{k}": v for k, v in val_metrics.items()})
+                logs["epoch_seconds"] = time.time() - started
+
+                if monitor_key is None:
+                    monitor_key = config.resolved_monitor(logs)
+                metric = float(logs[monitor_key])
+                counts = epoch >= config.resolved_monitor_start
+
+                if (counts and metric < best_metric - 1e-9) or best_epoch == 0:
+                    # `best_epoch == 0` keeps a usable best.safetensors from
+                    # epoch 1 even while the monitor is still warming up, so a
+                    # run killed early is not left without one.
+                    if counts or best_epoch == 0:
+                        if counts:
+                            best_metric, best_epoch = metric, epoch
+                        else:
+                            best_epoch = epoch
+                        self.save(
+                            os.path.join(self.checkpoint_dir, "best.safetensors"),
+                            epoch=epoch,
+                        )
+                        logs["best"] = 1.0
+                else:
+                    logs["best"] = 0.0
+
+                if not counts:
+                    # `EarlyStopping.start_epoch` does the withholding, so the
+                    # key stays in `logs` for the loggers to record.
+                    if epoch == self.start_epoch:
+                        print(
+                            f"[monitor] {monitor_key} starts deciding best and "
+                            f"early stopping at epoch {config.resolved_monitor_start}, "
+                            "when scheduled sampling engages"
+                        )
+
+                # `last` is written every epoch, not only at the end, so a run
+                # killed at hour five can still be resumed from hour five.
+                self.save(os.path.join(self.checkpoint_dir, "last.safetensors"), epoch=epoch)
+
+                self.callbacks.on_epoch_end(epoch, logs)
+
+                if epoch % config.log_every == 0:
+                    self._log(epoch, train_metrics, val_metrics, time.time() - started)
+
+                self._write_history()
+
+                if self.callbacks.stop_training:
+                    break
+        finally:
+            self.callbacks.on_train_end({"best_epoch": best_epoch, "best": best_metric})
+            self._write_history()
+
+        print(
+            f"best {monitor_key or 'n/a'} = {best_metric:.6f} at epoch {best_epoch}"
+            if best_epoch
+            else "no epoch completed"
+        )
         return self.history
+
+    def _write_history(self) -> None:
+        path = os.path.join(self.checkpoint_dir, "history.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.history, handle, indent=2)
+
+    def resume(self, path: str) -> int:
+        """Continue a run from a checkpoint, returning the next epoch.
+
+        Restores weights, optimizer moments and the calibrated loss weights, so
+        the resumed run optimises the same objective it stopped on.
+        """
+        metadata = self.load(path)
+        finished = int(metadata.get("epoch") or 0)
+        self.start_epoch = finished + 1
+        print(f"resumed {path} at epoch {finished}; continuing from {self.start_epoch}")
+        return self.start_epoch
 
     def _record(self, prefix: str, metrics: dict) -> None:
         for name, value in metrics.items():
@@ -594,3 +824,20 @@ class PreTrainer:
         }
         with open(os.path.join(self.checkpoint_dir, "manifest.json"), "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2)
+
+
+class _LegacyEpochHook(Callback):
+    """Adapts `fit(on_epoch_end=...)` to the callback protocol.
+
+    The single callable predates the callback list. Kept working rather than
+    removed, since scripts already pass it.
+    """
+
+    def __init__(self, hook):
+        self.hook = hook
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        train = {k[len("train_") :]: v for k, v in logs.items() if k.startswith("train_")}
+        validation = {k[len("val_") :]: v for k, v in logs.items() if k.startswith("val_")}
+        self.hook(epoch, train, validation or None)

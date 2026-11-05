@@ -29,7 +29,25 @@ class IoSpec:
     Attributes:
         pose_dim: the stored pose width, `n_joints * 6 + 7`.
         joystick_dim: 12, the desired future root positions and facing.
-        n_candidates: K, how many retrieved poses the model reads.
+        n_candidates: K, how many retrieved poses the model reads. Ignored
+            when `use_retrieval` is False, but kept so the same spec can be
+            extended for a later phase without re-deciding K.
+        use_retrieval: whether the candidate block is part of the input at all.
+
+            False is the Phase 1 setting. Pre-training predicts the next mocap
+            frame from the true previous one, and at 60Hz that is nearly solved
+            by continuity: measured on LaFAN1, copying the previous pose scores
+            2.29 against 16.24 for copying the nearest retrieved candidate, and
+            the retrieval ablation came out at -0.0013. So the candidate block
+            -- 604 of 771 input numbers, 78% of the width -- carries no signal
+            the objective rewards, and training with it risks teaching the
+            model that its knowledge base is noise, which Phase 2 would then
+            have to unlearn.
+
+            Retrieval is introduced in Phase 2, where the target is the KNN
+            teacher's own output and the candidates are therefore causally
+            load-bearing. The handoff extends this layer rather than replacing
+            it; see `mmm.training.checkpoints.extend_input_layer`.
         predict_contacts: whether the output carries foot contact logits.
         n_feet: how many contact logits, if it does.
     """
@@ -37,6 +55,7 @@ class IoSpec:
     pose_dim: int
     joystick_dim: int = 12
     n_candidates: int = 4
+    use_retrieval: bool = True
     predict_contacts: bool = True
     n_feet: int = 2
 
@@ -44,16 +63,14 @@ class IoSpec:
     def input_dim(self) -> int:
         """Total width entering the input layer.
 
-        Joystick, the model's own previous pose, and K retrieved poses, plus one
-        validity flag per candidate so a masked-out candidate is distinguishable
-        from a genuinely zero pose.
+        Joystick, the model's own previous pose, and -- when retrieval is in
+        use -- K retrieved poses plus one validity flag each, so a masked-out
+        candidate is distinguishable from a genuinely zero pose.
         """
-        return (
-            self.joystick_dim
-            + self.pose_dim
-            + self.n_candidates * self.pose_dim
-            + self.n_candidates
-        )
+        width = self.joystick_dim + self.pose_dim
+        if self.use_retrieval:
+            width += self.n_candidates * self.pose_dim + self.n_candidates
+        return width
 
     @property
     def output_dim(self) -> int:
@@ -65,14 +82,19 @@ class IoSpec:
         Declared here so the C++ engine, the ONNX export and the policy all
         read one definition instead of three agreeing by luck.
         """
-        offsets = {}
-        cursor = 0
-        for name, size in (
+        blocks = [
             ("joystick", self.joystick_dim),
             ("previous_pose", self.pose_dim),
-            ("candidates", self.n_candidates * self.pose_dim),
-            ("candidate_mask", self.n_candidates),
-        ):
+        ]
+        if self.use_retrieval:
+            blocks += [
+                ("candidates", self.n_candidates * self.pose_dim),
+                ("candidate_mask", self.n_candidates),
+            ]
+
+        offsets = {}
+        cursor = 0
+        for name, size in blocks:
             offsets[name] = slice(cursor, cursor + size)
             cursor += size
         return offsets

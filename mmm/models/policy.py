@@ -55,10 +55,17 @@ class MmmPolicy(nn.Module):
         head: str = "full",
         d_model: int = 256,
         retrieval_dropout: float = 0.1,
+        input_dropout: float = 0.0,
+        hidden_dropout: float = 0.0,
     ):
         super().__init__()
         self.spec = spec
         self.retrieval_dropout = retrieval_dropout
+        # Plain dropout, off by default. The strongest overfitting controls
+        # here are the clip-disjoint split and early stopping; these are for
+        # when the validation curve turns up before the training curve flattens.
+        self.input_dropout = nn.Dropout(input_dropout) if input_dropout > 0 else nn.Identity()
+        self.hidden_dropout = nn.Dropout(hidden_dropout) if hidden_dropout > 0 else nn.Identity()
 
         if backbone is None:
             backbone = MambaBackbone(MambaConfig(d_model=d_model))
@@ -82,7 +89,7 @@ class MmmPolicy(nn.Module):
         self,
         joystick: torch.Tensor,
         previous_pose: torch.Tensor,
-        candidates: torch.Tensor,
+        candidates: torch.Tensor | None = None,
         candidate_mask: torch.Tensor | None = None,
         apply_retrieval_dropout: bool = False,
     ) -> torch.Tensor:
@@ -103,6 +110,18 @@ class MmmPolicy(nn.Module):
         """
         spec = self.spec
         batch_shape = joystick.shape[:-1]
+
+        if not spec.use_retrieval:
+            # Phase 1: motion only. Candidates are accepted and ignored, so a
+            # loader that still produces them costs nothing and the same
+            # training loop serves both settings.
+            return torch.cat([joystick, previous_pose], dim=-1)
+
+        if candidates is None:
+            raise ValueError(
+                "this policy was built with use_retrieval=True, so candidates "
+                "are required; got None"
+            )
 
         if candidates.shape[-2:] != (spec.n_candidates, spec.pose_dim):
             raise ValueError(
@@ -147,7 +166,7 @@ class MmmPolicy(nn.Module):
         self,
         joystick: torch.Tensor,
         previous_pose: torch.Tensor,
-        candidates: torch.Tensor,
+        candidates: torch.Tensor | None = None,
         candidate_mask: torch.Tensor | None = None,
         state=None,
         apply_retrieval_dropout: bool = False,
@@ -165,8 +184,8 @@ class MmmPolicy(nn.Module):
         x = self.build_input(
             joystick, previous_pose, candidates, candidate_mask, apply_retrieval_dropout
         )
-        hidden, new_state = self.backbone(self.input_layer(x), state)
-        raw_pose, contacts = self.output_layer(hidden)
+        hidden, new_state = self.backbone(self.input_dropout(self.input_layer(x)), state)
+        raw_pose, contacts = self.output_layer(self.hidden_dropout(hidden))
         pose = self.head(raw_pose, candidates, candidate_mask)
         return pose, contacts, new_state
 
@@ -174,7 +193,7 @@ class MmmPolicy(nn.Module):
         self,
         joystick: torch.Tensor,
         previous_pose: torch.Tensor,
-        candidates: torch.Tensor,
+        candidates: torch.Tensor | None = None,
         candidate_mask: torch.Tensor | None = None,
         state=None,
     ):
@@ -188,8 +207,8 @@ class MmmPolicy(nn.Module):
         if state is None:
             state = self.initial_state(joystick.shape[0], device=joystick.device, dtype=joystick.dtype)
         x = self.build_input(joystick, previous_pose, candidates, candidate_mask)
-        hidden, new_state = self.backbone.step(self.input_layer(x), state)
-        raw_pose, contacts = self.output_layer(hidden)
+        hidden, new_state = self.backbone.step(self.input_dropout(self.input_layer(x)), state)
+        raw_pose, contacts = self.output_layer(self.hidden_dropout(hidden))
         pose = self.head(raw_pose, candidates, candidate_mask)
         return pose, contacts, new_state
 
@@ -206,6 +225,7 @@ class MmmPolicy(nn.Module):
             "pose_dim": self.spec.pose_dim,
             "joystick_dim": self.spec.joystick_dim,
             "n_candidates": self.spec.n_candidates,
+            "use_retrieval": self.spec.use_retrieval,
             "input_dim": self.spec.input_dim,
             "output_dim": self.spec.output_dim,
             "predict_contacts": self.spec.predict_contacts,
