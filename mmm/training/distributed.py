@@ -111,14 +111,54 @@ class DistributedContext:
         return context
 
     def initialize(self) -> None:
+        """Join the process group, binding this rank to its own GPU.
+
+        Two details that NCCL warns about otherwise:
+
+        - `set_device` comes **before** `init_process_group`, so the collective
+          library sees the right device from the start rather than inferring
+          one from the global rank.
+        - `device_id` is passed when the installed torch accepts it. Without
+          it NCCL prints "Guessing device ID based on global rank. This can
+          cause a hang if rank to GPU mapping is heterogeneous", and a
+          `barrier()` before any tensor collective has no device to use. On a
+          uniform two GPU node the guess is right; it stops being right the
+          moment the mapping is not one rank per identical GPU in order, and
+          the symptom there is a hang rather than an error.
+
+        `device_id` was added in torch 2.3, so it is passed only if the
+        signature has it. Probing the signature rather than the version number
+        because the parameter has moved between keyword-only and positional
+        across releases.
+        """
         if not self.enabled:
             return
+        import inspect
+
         import torch.distributed as dist
 
-        if not dist.is_initialized():
-            dist.init_process_group(backend=self.backend)
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
+
+        if dist.is_initialized():
+            return
+
+        kwargs = {"backend": self.backend}
+        if self.device.type == "cuda":
+            try:
+                accepted = inspect.signature(dist.init_process_group).parameters
+            except (TypeError, ValueError):  # pragma: no cover - C bindings
+                accepted = {}
+            if "device_id" in accepted:
+                kwargs["device_id"] = self.device
+
+        try:
+            dist.init_process_group(**kwargs)
+        except TypeError:
+            # An unexpected signature is not worth failing a run over; the
+            # guessed device is correct on a uniform node.
+            kwargs.pop("device_id", None)
+            dist.init_process_group(**kwargs)
 
     def shutdown(self) -> None:
         if not self.enabled:

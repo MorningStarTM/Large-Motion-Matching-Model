@@ -194,19 +194,33 @@ class TensorBoard(Callback):
         self._step = 0
 
     def on_train_begin(self, logs=None):
+        # Broad except, not just ImportError. TensorBoard imports fine and then
+        # fails on a numpy mismatch -- observed on Kaggle as
+        # "module 'numpy.dtypes' has no attribute 'StringDType'", which is a
+        # build expecting numpy >= 2 beside numpy 1.x. Either way the answer is
+        # the same: say so once and carry on, because metrics.csv and
+        # history.json already hold everything.
         try:
             from torch.utils.tensorboard import SummaryWriter
-        except ImportError:
+
+            self.writer = SummaryWriter(self.log_dir)
+        except Exception as error:  # noqa: BLE001
             print(
-                "[TensorBoard] not available (needs `pip install tensorboard`); "
+                f"[TensorBoard] unavailable ({type(error).__name__}: {error}); "
                 "skipping. Metrics still go to history.json and metrics.csv."
             )
+            self.writer = None
             return
-        self.writer = SummaryWriter(self.log_dir)
+
         if logs:
             # Hyperparameters as text, because `add_hparams` insists on pairing
             # them with final metrics, which do not exist yet at this point.
-            self.writer.add_text("config", f"```json\n{json.dumps(logs, indent=2)}\n```", 0)
+            try:
+                self.writer.add_text(
+                    "config", f"```json\n{json.dumps(logs, indent=2)}\n```", 0
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"[TensorBoard] could not write the config block: {error}")
 
     def on_batch_end(self, batch, logs=None):
         self._step += 1
