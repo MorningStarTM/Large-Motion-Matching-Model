@@ -54,11 +54,37 @@ def parse_args(argv=None):
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--head", default="full", choices=["full", "residual"])
     parser.add_argument("--retrieval-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--use-retrieval",
+        action="store_true",
+        help="include the retrieved candidates in the input (771 wide). OFF by "
+        "default: pre-training learns the motion prior from joystick plus "
+        "previous pose (163 wide). Measured, retrieval contributes -0.0013 "
+        "here, because the true previous pose scores 2.29 against 16.24 for "
+        "the nearest candidate. Retrieval belongs in Phase 2, where the target "
+        "is the teacher's own output. Use this flag only for that ablation.",
+    )
+    parser.add_argument("--input-dropout", type=float, default=0.0)
+    parser.add_argument("--hidden-dropout", type=float, default=0.0)
     parser.add_argument("--no-contacts", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument(
+        "--lr-schedule", default="cosine", choices=["cosine", "linear", "constant", "step"]
+    )
+    parser.add_argument("--warmup-epochs", type=float, default=1.0)
+    parser.add_argument("--min-lr-factor", type=float, default=0.05)
+    parser.add_argument(
+        "--monitor",
+        default="val_rollout_total",
+        help="metric deciding best.safetensors and early stopping. Defaults to "
+        "the free running loss, since a drift resistant prior is what Phase 1 "
+        "is for and the teacher forced loss cannot see drift.",
+    )
+    parser.add_argument("--no-tensorboard", action="store_true")
+    parser.add_argument("--resume", default="", help="checkpoint to continue from")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=0)
@@ -86,6 +112,7 @@ def build_policy(args, database: MotionDatabase) -> MmmPolicy:
     spec = IoSpec(
         pose_dim=database.pose_dim,
         n_candidates=args.k,
+        use_retrieval=args.use_retrieval,
         predict_contacts=not args.no_contacts,
     )
     if args.backbone == "mamba":
@@ -99,6 +126,8 @@ def build_policy(args, database: MotionDatabase) -> MmmPolicy:
         head=args.head,
         d_model=args.d_model,
         retrieval_dropout=args.retrieval_dropout,
+        input_dropout=args.input_dropout,
+        hidden_dropout=args.hidden_dropout,
     )
 
 
@@ -123,6 +152,7 @@ def main(argv=None) -> int:
         k=args.k,
         leave_one_clip_out=not args.no_leave_one_clip_out,
         seed=args.seed,
+        use_retrieval=args.use_retrieval,
         cache_dir=None
         if args.retrieval_cache == "none"
         else (args.retrieval_cache or args.database),
@@ -150,10 +180,17 @@ def main(argv=None) -> int:
         learning_rate=args.learning_rate,
         patience=args.patience,
         device=args.device,
+        lr_schedule=args.lr_schedule,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_factor=args.min_lr_factor,
+        monitor=args.monitor,
+        tensorboard=not args.no_tensorboard,
         loss_weights=LossWeights(residual=args.residual_weight),
     )
     trainer = PreTrainer(policy, database, config, checkpoint_dir=args.out)
     print(f"device: {trainer.device}")
+    if args.resume:
+        trainer.resume(args.resume)
 
     train_loader = DataLoader(
         train_set,
