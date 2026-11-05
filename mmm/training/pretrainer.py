@@ -48,6 +48,7 @@ from mmm.training.callbacks import (
     TensorBoard,
 )
 from mmm.training.checkpoints import load_checkpoint, save_checkpoint
+from mmm.training.distributed import DistributedContext
 from mmm.training.schedules import build_schedule
 from mmm.training.losses import LossWeights, PoseLoss
 
@@ -132,6 +133,18 @@ class PreTrainerConfig:
     csv_log: bool = True
     progress_every: int = 25
 
+    # torch.compile the policy. Targets the real bottleneck -- the selective
+    # scan materialises a (batch, seq, d_inner, d_state) tensor, 134 MB across
+    # four layers, and the elementwise work over it is memory bandwidth bound,
+    # which is exactly what fusion removes.
+    #
+    # Only the teacher forced path benefits: compile wraps `forward`, while the
+    # scheduled sampling path drives `step` frame by frame. Untestable on
+    # Windows, where torch 2.1's inductor backend needs a triton wheel that
+    # does not exist, so a failure to compile is reported and ignored rather
+    # than fatal.
+    compile_policy: bool = False
+
     @property
     def resolved_monitor_start(self) -> int:
         if self.monitor_start_epoch is not None:
@@ -177,6 +190,7 @@ class PreTrainerConfig:
                 "monitor",
                 "min_delta",
                 "monitor_start_epoch",
+                "compile_policy",
                 "rollout_eval_batches",
             )
         }
@@ -201,18 +215,36 @@ class PreTrainer:
         database: MotionDatabase,
         config: PreTrainerConfig | None = None,
         checkpoint_dir: str = "runs/phase1",
+        distributed: DistributedContext | None = None,
     ):
         self.config = config or PreTrainerConfig()
         self.database = database
         self.checkpoint_dir = checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # A single process context behaves as a no-op throughout, so the single
+        # GPU path is the same code path rather than a second one.
+        self.distributed = distributed or DistributedContext()
+        self.device = self.distributed.device
 
         if self.config.device is not None:
             self.device = torch.device(self.config.device)
-        else:
+        elif not self.distributed.enabled:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        if self.distributed.is_main:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
         self.policy = policy.to(self.device)
+        # Every rank must start from identical weights, or they average
+        # gradients computed from different models.
+        self.distributed.broadcast_parameters(self.policy)
+
+        # `self.module` is always the real policy: `save`, `load` and
+        # `describe` must never see a compiled or wrapped object, since its
+        # state dict keys are prefixed and would not load back.
+        self.module = self.policy
+        if self.config.compile_policy:
+            self.policy = self._compile(self.policy)
         self.loss_fn = PoseLoss(
             skeleton=database.skeleton,
             frame_time=database.frame_time,
@@ -220,7 +252,7 @@ class PreTrainer:
             n_joints=database.skeleton.n_joints,
         )
         self.optimizer = torch.optim.AdamW(
-            self.policy.parameters(),
+            self.module.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
@@ -231,6 +263,22 @@ class PreTrainer:
         self.schedule = None
         self.steps_per_epoch = 0
         self.callbacks = None
+
+    def _compile(self, policy):
+        try:
+            compiled = torch.compile(policy)
+            if self.distributed.is_main:
+                print("[compile] torch.compile enabled for the teacher forced path")
+            return compiled
+        except Exception as error:  # noqa: BLE001
+            if self.distributed.is_main:
+                print(f"[compile] unavailable ({type(error).__name__}: {error}); continuing uncompiled")
+            return policy
+
+    def _print(self, *args, **kwargs) -> None:
+        """Print on the main rank only, so N processes do not log N times."""
+        if self.distributed.is_main:
+            print(*args, **kwargs)
 
     # -- schedules --------------------------------------------------------
 
@@ -282,11 +330,11 @@ class PreTrainer:
             )
         else:
             batch_size, seq_len = joystick.shape[0], joystick.shape[1]
-            state = self.policy.initial_state(batch_size, device=joystick.device)
+            state = self.module.initial_state(batch_size, device=joystick.device)
             fed = previous[:, 0]
             poses, contact_list = [], []
             for t in range(seq_len):
-                pose_t, contacts_t, state = self.policy.step(
+                pose_t, contacts_t, state = self.module.step(
                     joystick[:, t],
                     fed,
                     None if candidates is None else candidates[:, t],
@@ -310,7 +358,7 @@ class PreTrainer:
             contacts = torch.stack(contact_list, dim=1) if contact_list else None
 
         correction = None
-        if isinstance(self.policy.head, ResidualHead) and candidates is not None:
+        if isinstance(self.module.head, ResidualHead) and candidates is not None:
             correction = ResidualHead.correction(pose, candidates, mask)
 
         return pose, contacts, correction
@@ -354,12 +402,18 @@ class PreTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
+            # Average gradients across ranks here rather than through DDP: the
+            # scheduled sampling path drives `step` frame by frame and never
+            # calls the wrapped `forward` DDP hooks itself onto. See
+            # mmm/training/distributed.py.
+            self.distributed.all_reduce_gradients(self.module)
+
             # The norm before clipping, which is the diagnostic worth having:
             # after clipping it is just `grad_clip` whenever anything is wrong.
             if self.config.grad_clip > 0:
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        self.policy.parameters(), self.config.grad_clip
+                        self.module.parameters(), self.config.grad_clip
                     )
                 )
             else:
@@ -373,14 +427,17 @@ class PreTrainer:
                 totals[name] = totals.get(name, 0.0) + value
             n_batches += 1
 
-            if self.callbacks is not None:
+            if self.callbacks is not None and self.distributed.is_main:
                 self.callbacks.on_batch_end(
                     index, {**terms, "lr": lr, "grad_norm": grad_norm}
                 )
 
         result = {name: value / max(n_batches, 1) for name, value in totals.items()}
-        result["sampling_probability"] = probability
         result["grad_norm"] = grad_norm_total / max(n_batches, 1)
+        # Averaged over ranks, or a logged loss is whatever rank 0's shard
+        # happened to hold rather than the quantity being optimised.
+        result = self.distributed.all_reduce_metrics(result)
+        result["sampling_probability"] = probability
         result["lr"] = float(self.optimizer.param_groups[0]["lr"])
         return result
 
@@ -591,9 +648,13 @@ class PreTrainer:
             built.append(_LegacyEpochHook(on_epoch_end))
         built.extend(callbacks or [])
 
-        self.callbacks = CallbackList(built, trainer=self)
+        # Only rank 0 logs and writes files; the others would duplicate every
+        # row and race on every handle.
+        self.callbacks = CallbackList(
+            built if self.distributed.is_main else [], trainer=self
+        )
         self.callbacks.on_train_begin(
-            {"config": config.as_dict(), "architecture": self.policy.describe()}
+            {"config": config.as_dict(), "architecture": self.module.describe()}
         )
 
         best_metric = math.inf
@@ -606,8 +667,21 @@ class PreTrainer:
                 started = time.time()
                 self.callbacks.on_epoch_begin(epoch)
 
+                # A DistributedSampler reshuffles only when told which epoch it
+                # is; without this every epoch sees the same shard order and
+                # the shuffling silently does nothing.
+                sampler = getattr(train_loader, "sampler", None)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+
                 train_metrics = self.train_epoch(train_loader, epoch)
-                val_metrics = self.validate(val_loader) if val_loader is not None else None
+
+                # Validation on rank 0 only. It is not sharded, so every rank
+                # would compute the identical thing, and the free running
+                # rollout is the most expensive part of an epoch.
+                val_metrics = None
+                if val_loader is not None and self.distributed.is_main:
+                    val_metrics = self.validate(val_loader)
 
                 self._record("train", train_metrics)
                 if val_metrics is not None:
@@ -619,16 +693,23 @@ class PreTrainer:
                     logs.update({f"val_{k}": v for k, v in val_metrics.items()})
                 logs["epoch_seconds"] = time.time() - started
 
-                if monitor_key is None:
-                    monitor_key = config.resolved_monitor(logs)
-                metric = float(logs[monitor_key])
+                # Monitor resolution, best tracking and checkpointing are all
+                # rank 0's business. Only rank 0 validates, so on other ranks
+                # `logs` carries no val_* key at all and resolving a monitor
+                # there would fall back to a different metric and print a
+                # warning about a misconfiguration that does not exist.
+                logs["best"] = 0.0
                 counts = epoch >= config.resolved_monitor_start
 
-                if (counts and metric < best_metric - 1e-9) or best_epoch == 0:
-                    # `best_epoch == 0` keeps a usable best.safetensors from
-                    # epoch 1 even while the monitor is still warming up, so a
-                    # run killed early is not left without one.
-                    if counts or best_epoch == 0:
+                if self.distributed.is_main:
+                    if monitor_key is None:
+                        monitor_key = config.resolved_monitor(logs)
+                    metric = float(logs[monitor_key])
+
+                    if (counts and metric < best_metric - 1e-9) or best_epoch == 0:
+                        # `best_epoch == 0` keeps a usable best.safetensors
+                        # from epoch 1 even while the monitor is still warming
+                        # up, so a run killed early is not left without one.
                         if counts:
                             best_metric, best_epoch = metric, epoch
                         else:
@@ -638,10 +719,8 @@ class PreTrainer:
                             epoch=epoch,
                         )
                         logs["best"] = 1.0
-                else:
-                    logs["best"] = 0.0
 
-                if not counts:
+                if self.distributed.is_main and not counts:
                     # `EarlyStopping.start_epoch` does the withholding, so the
                     # key stays in `logs` for the loggers to record.
                     if epoch == self.start_epoch:
@@ -653,26 +732,44 @@ class PreTrainer:
 
                 # `last` is written every epoch, not only at the end, so a run
                 # killed at hour five can still be resumed from hour five.
-                self.save(os.path.join(self.checkpoint_dir, "last.safetensors"), epoch=epoch)
+                if self.distributed.is_main:
+                    self.save(
+                        os.path.join(self.checkpoint_dir, "last.safetensors"), epoch=epoch
+                    )
 
                 self.callbacks.on_epoch_end(epoch, logs)
 
                 if epoch % config.log_every == 0:
                     self._log(epoch, train_metrics, val_metrics, time.time() - started)
 
-                self._write_history()
+                if self.distributed.is_main:
+                    self._write_history()
 
-                if self.callbacks.stop_training:
+                # The stop decision is made on rank 0 from a validation pass
+                # only rank 0 ran. Sharing it is not optional: one process
+                # leaving the loop while the others wait in the next collective
+                # is a hang, not an error.
+                if self.distributed.broadcast_flag(self.callbacks.stop_training):
                     break
         finally:
             self.callbacks.on_train_end({"best_epoch": best_epoch, "best": best_metric})
-            self._write_history()
+            if self.distributed.is_main:
+                self._write_history()
+            # Nobody tears down until everybody has finished the loop.
+            self.distributed.barrier()
 
-        print(
-            f"best {monitor_key or 'n/a'} = {best_metric:.6f} at epoch {best_epoch}"
-            if best_epoch
-            else "no epoch completed"
-        )
+        if not best_epoch:
+            self._print("no epoch completed")
+        elif math.isinf(best_metric):
+            # The run ended before `monitor_start_epoch`, so nothing was ever
+            # compared. The checkpoint is real; the metric is not.
+            self._print(
+                f"best.safetensors is epoch {best_epoch}; {monitor_key} never "
+                f"started deciding (it does from epoch "
+                f"{config.resolved_monitor_start})"
+            )
+        else:
+            self._print(f"best {monitor_key} = {best_metric:.6f} at epoch {best_epoch}")
         return self.history
 
     def _write_history(self) -> None:
@@ -689,7 +786,7 @@ class PreTrainer:
         metadata = self.load(path)
         finished = int(metadata.get("epoch") or 0)
         self.start_epoch = finished + 1
-        print(f"resumed {path} at epoch {finished}; continuing from {self.start_epoch}")
+        self._print(f"resumed {path} at epoch {finished}; continuing from {self.start_epoch}")
         return self.start_epoch
 
     def _record(self, prefix: str, metrics: dict) -> None:
@@ -697,6 +794,8 @@ class PreTrainer:
             self.history.setdefault(f"{prefix}_{name}", []).append(value)
 
     def _log(self, epoch, train_metrics, val_metrics, seconds) -> None:
+        if not self.distributed.is_main:
+            return
         line = (
             f"epoch {epoch:3d}/{self.config.epochs} "
             f"| train {train_metrics['total']:.5f} "
@@ -738,12 +837,12 @@ class PreTrainer:
 
         return save_checkpoint(
             path,
-            policy=self.policy,
+            policy=self.module,
             optimizer=self.optimizer if optimizer else None,
             metadata={
                 "epoch": epoch,
                 "phase": 1,
-                "architecture": self.policy.describe(),
+                "architecture": self.module.describe(),
                 "loss_weights": self.loss_fn.weights.as_dict(),
                 "config": self.config.as_dict(),
                 # Pins the checkpoint to the data it was trained on. A policy
@@ -769,7 +868,7 @@ class PreTrainer:
         blob = load_checkpoint(path, device=self.device)
         if strict and "architecture" in blob:
             saved = blob["architecture"]
-            current = self.policy.describe()
+            current = self.module.describe()
             for key in ("pose_dim", "input_dim", "output_dim", "n_candidates", "d_model", "head"):
                 if saved.get(key) != current.get(key):
                     raise ValueError(
@@ -782,7 +881,7 @@ class PreTrainer:
         # before any weights are touched.
         load_checkpoint(
             path,
-            policy=self.policy,
+            policy=self.module,
             optimizer=self.optimizer if blob.get("has_optimizer", True) else None,
             device=self.device,
         )
@@ -808,11 +907,13 @@ class PreTrainer:
         return blob
 
     def _write_manifest(self) -> None:
+        if not self.distributed.is_main:
+            return
         from mmm.teacher.logger import database_fingerprint
 
         manifest = {
             "phase": 1,
-            "architecture": self.policy.describe(),
+            "architecture": self.module.describe(),
             "config": self.config.as_dict(),
             "device": str(self.device),
             "database": {
