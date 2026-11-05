@@ -53,6 +53,7 @@ from mmm.models.io_layers import IoSpec
 from mmm.models.mamba_backbone import MambaBackbone, MambaConfig
 from mmm.models.policy import MmmPolicy
 from mmm.training.losses import LossWeights
+from mmm.training.distributed import DistributedContext
 from mmm.training.pretrainer import PreTrainer, PreTrainerConfig
 from mmm.workspace import Workspace
 
@@ -158,6 +159,26 @@ def parse_args(argv=None):
     stopping.add_argument("--rollout-eval-batches", type=int, default=8)
     stopping.add_argument("--residual-weight", type=float, default=0.0)
 
+    speed = parser.add_argument_group("speed")
+    speed.add_argument(
+        "--compile",
+        dest="compile_policy",
+        action="store_true",
+        help="torch.compile the policy. Targets the real bottleneck: the "
+        "selective scan's (batch, seq, d_inner, d_state) tensor is 134 MB "
+        "across four layers and the elementwise work over it is bandwidth "
+        "bound, which fusion removes. Only the teacher forced path benefits. "
+        "Needs a triton wheel, so Linux only; a failure is reported, not fatal.",
+    )
+    speed.add_argument(
+        "--lr-scale",
+        default="none",
+        choices=["none", "linear", "sqrt"],
+        help="scale the learning rate by the process count. --batch-size is "
+        "PER GPU, so two GPUs double the effective batch and leave the rate "
+        "tuned for half of it. 'linear' is the usual choice.",
+    )
+
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--device", default=None)
     runtime.add_argument("--seed", type=int, default=0)
@@ -221,6 +242,17 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
 
+    # No launcher environment means one process, and every collective becomes a
+    # no-op: the single GPU path is this same path.
+    distributed = DistributedContext.from_env(device=args.device)
+    main_rank = distributed.is_main
+
+    def say(*parts, **kwargs):
+        if main_rank:
+            print(*parts, **kwargs)
+
+    say(distributed)
+
     workspace = Workspace.resolve(
         out=args.out or None,
         database=args.database_dir or None,
@@ -228,8 +260,12 @@ def main(argv=None) -> int:
         root=args.work_dir or None,
         run_name=args.run_name,
     )
-    print(workspace)
+    say(workspace)
 
+    # Rank 0 builds the database; the others wait and then read it, or several
+    # processes write the same files at once.
+    if not main_rank:
+        distributed.barrier()
     database_path = ensure_database(
         source=args.dataset,
         out_dir=workspace.database,
@@ -239,9 +275,13 @@ def main(argv=None) -> int:
         max_frames=args.max_frames,
         full_skeleton=args.full_skeleton,
         rebuild=args.rebuild_database,
+        verbose=main_rank,
     )
+    if main_rank:
+        distributed.barrier()
+
     database = MotionDatabase.load(database_path)
-    print(database)
+    say(database)
 
     dataset = WindowDataset(
         database,
@@ -255,12 +295,12 @@ def main(argv=None) -> int:
         cache_dir=workspace.cache,
     )
     train_set, val_set = dataset.split(validation_fraction=args.validation_fraction)
-    print(f"{len(train_set)} training windows, {len(val_set)} validation windows")
+    say(f"{len(train_set)} training windows, {len(val_set)} validation windows")
 
     train_clips = sorted({database.clips[c].name for c, _ in train_set.windows})
     val_clips = sorted({database.clips[c].name for c, _ in val_set.windows})
-    print(f"  train clips: {len(train_clips)}  {train_clips}")
-    print(f"  val clips:   {len(val_clips)}  {val_clips}")
+    say(f"  train clips: {len(train_clips)}  {train_clips}")
+    say(f"  val clips:   {len(val_clips)}  {val_clips}")
     # Split by clip, not by window: consecutive frames of a 60Hz clip are
     # nearly identical, so sharing a clip across the split would make
     # validation measure memorisation.
@@ -271,13 +311,30 @@ def main(argv=None) -> int:
         return 1
 
     policy = build_policy(args, database)
-    print(f"policy: {policy.n_parameters():,} parameters")
+    say(f"policy: {policy.n_parameters():,} parameters")
     for key, value in policy.describe().items():
-        print(f"  {key:18} {value}")
+        say(f"  {key:18} {value}")
+
+    # --batch-size is per process, so the effective batch is that times the
+    # world size. Leaving the rate unscaled is a real choice, not a default to
+    # stumble into, so it is reported either way.
+    learning_rate = args.learning_rate
+    effective_batch = args.batch_size * distributed.world_size
+    if distributed.world_size > 1:
+        if args.lr_scale == "linear":
+            learning_rate *= distributed.world_size
+        elif args.lr_scale == "sqrt":
+            learning_rate *= distributed.world_size**0.5
+        say(
+            f"effective batch {effective_batch} "
+            f"({args.batch_size} x {distributed.world_size} processes); "
+            f"lr {args.learning_rate:.2e} -> {learning_rate:.2e} "
+            f"[--lr-scale {args.lr_scale}]"
+        )
 
     config = PreTrainerConfig(
         epochs=args.epochs,
-        learning_rate=args.learning_rate,
+        learning_rate=learning_rate,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         scheduled_sampling_start=args.ss_start,
@@ -293,34 +350,86 @@ def main(argv=None) -> int:
         rollout_eval_batches=args.rollout_eval_batches,
         tensorboard=not args.no_tensorboard,
         progress_every=args.progress_every,
+        compile_policy=args.compile_policy,
         loss_weights=LossWeights(residual=args.residual_weight),
     )
-    trainer = PreTrainer(policy, database, config, checkpoint_dir=workspace.out)
-    print(f"device: {trainer.device}")
+    trainer = PreTrainer(
+        policy,
+        database,
+        config,
+        checkpoint_dir=workspace.out,
+        distributed=distributed,
+    )
+    say(f"device: {trainer.device}")
 
     resume = args.resume
     if resume == "auto":
         candidate = os.path.join(workspace.out, "last.safetensors")
         resume = candidate if os.path.exists(candidate) else ""
-        print(f"--resume auto: {'resuming ' + resume if resume else 'nothing to resume from'}")
+        say(f"--resume auto: {'resuming ' + resume if resume else 'nothing to resume from'}")
     if resume:
         trainer.resume(resume)
 
-    with open(os.path.join(workspace.out, "run_args.json"), "w", encoding="utf-8") as handle:
-        json.dump({"args": vars(args), "workspace": workspace.describe()}, handle, indent=2)
+    if main_rank:
+        with open(
+            os.path.join(workspace.out, "run_args.json"), "w", encoding="utf-8"
+        ) as handle:
+            json.dump(
+                {
+                    "args": vars(args),
+                    "workspace": workspace.describe(),
+                    "world_size": distributed.world_size,
+                    "effective_batch": effective_batch,
+                    "learning_rate": learning_rate,
+                },
+                handle,
+                indent=2,
+            )
 
     loader_kwargs = dict(collate_fn=collate, num_workers=args.workers)
     if args.workers:
         # Each worker would otherwise re-parse nothing but still copy the
         # database; keeping them alive avoids paying that every epoch.
         loader_kwargs["persistent_workers"] = True
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    if distributed.enabled:
+        from torch.utils.data.distributed import DistributedSampler
 
-    trainer.fit(train_loader, val_loader)
-    print(f"\nwrote checkpoints and history to {workspace.out}")
+        # Shards the windows across processes. Without it every rank trains on
+        # all of them: N GPUs doing identical work, no speedup, and a silently
+        # N-times larger effective batch.
+        #
+        # Applied after the clip-disjoint split, so no validation clip can
+        # reach a training shard.
+        sampler = DistributedSampler(
+            train_set,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=args.seed,
+        )
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size, sampler=sampler, **loader_kwargs
+        )
+    else:
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size, shuffle=True, **loader_kwargs
+        )
 
-    if args.hf_repo:
+    # Validation is not sharded: it runs on rank 0 only, so every rank
+    # computing it would be identical work thrown away.
+    val_loader = DataLoader(
+        val_set, batch_size=args.batch_size, shuffle=False, **loader_kwargs
+    )
+
+    try:
+        trainer.fit(train_loader, val_loader)
+    finally:
+        distributed.shutdown()
+    say(f"\nwrote checkpoints and history to {workspace.out}")
+
+    # Publishing is a rank 0 act: several processes uploading the same file
+    # would race, and the other ranks have nothing to add.
+    if args.hf_repo and main_rank:
         best = os.path.join(workspace.out, "best.safetensors")
         if not os.path.exists(best):
             print("no best checkpoint to publish", file=sys.stderr)
