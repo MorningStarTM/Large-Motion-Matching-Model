@@ -249,3 +249,10 @@ engine/build/
 *.o
 *.pyd
 *.a
+
+# Tests: kept local
+# Anchored with a leading slash on purpose. A bare `tests/` would also match
+# engine/tests/, the C++ side's own suite, which is not what was asked for --
+# the same slip that once made a bare `data/` ignore the whole mmm/data
+# source package.
+/tests/

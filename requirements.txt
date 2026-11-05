@@ -21,5 +21,14 @@ scipy>=1.10            # cKDTree, for the KNN search over the Matching Database
 # Pulls in cffi. Imported as `pyray` (or `raylib` for the C-style API).
 raylib>=5.0,<6.0
 
+# --- Phase 1: checkpoints and publishing --------------------------------
+# Checkpoints are safetensors, not torch.save pickles: loading a pickle runs
+# arbitrary code, which is the wrong property for a file that gets published
+# and downloaded. torch itself is expected to be in the env already.
+safetensors>=0.4
+
+# Only needed to run scripts/publish_checkpoint.py. Training never touches it.
+huggingface_hub>=0.23
+
 # --- development --------------------------------------------------------
 pytest>=7.4            # tests/test_fk.py, tests/test_features.py
