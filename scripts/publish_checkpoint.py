@@ -361,6 +361,19 @@ def main(argv=None) -> int:
         size = os.path.getsize(source) / 1e6 if source else len(card) / 1e6
         print(f"  {name:22} {size:8.2f} MB")
 
+    # Write the card beside the checkpoint whatever happens next. A dry run is
+    # the natural way to produce it for a manual upload, and an upload that
+    # fails on authentication should still leave the card behind rather than
+    # discard work that is already done.
+    card_path = os.path.join(os.path.dirname(args.checkpoint) or ".", "README.md")
+    try:
+        with open(card_path, "w", encoding="utf-8") as handle:
+            handle.write(card)
+        print(f"wrote {card_path}")
+    except OSError as error:
+        print(f"could not write {card_path}: {error}", file=sys.stderr)
+        card_path = None
+
     if args.dry_run:
         print("\n--- README.md ---")
         print(card)
@@ -389,9 +402,10 @@ def main(argv=None) -> int:
         exist_ok=True,
     )
 
-    card_path = os.path.join(os.path.dirname(args.checkpoint) or ".", "README.md")
-    with open(card_path, "w", encoding="utf-8") as handle:
-        handle.write(card)
+    if card_path is None:
+        print("the model card could not be written, so it will not be uploaded",
+              file=sys.stderr)
+        uploads = [entry for entry in uploads if entry[1] != "README.md"]
 
     for source, name in uploads:
         api.upload_file(
