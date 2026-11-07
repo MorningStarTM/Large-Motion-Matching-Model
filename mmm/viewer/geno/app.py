@@ -61,6 +61,10 @@ if RAYLIB_AVAILABLE:  # pragma: no cover - requires a display
 
 __all__ = ["GenoCharacter", "GenoViewerConfig", "GenoViewerApp"]
 
+# The record toggle is shared with the wireframe viewer, so the two
+# behave identically and there is one place to change it.
+from mmm.obstacles.viewer import _move_screenshot  # noqa: E402
+
 
 @dataclass
 class GenoViewerConfig:
@@ -377,7 +381,18 @@ class GenoViewerApp:  # pragma: no cover - requires a display
         for i, line in enumerate(lines):
             rl.draw_text(line, 12, 12 + i * 20, 18, Color(40, 40, 45, 255))
 
-    # -- the loop ---------------------------------------------------------
+    @staticmethod
+    def _capture(target):  # pragma: no cover - requires a display
+        """Write the finished frame to `target`.
+
+        raylib ignores any directory in the name and writes relative to the
+        working directory, so the file is taken by basename and moved.
+        """
+        if not target:
+            return
+        basename = os.path.basename(target)
+        rl.take_screenshot(basename.encode("utf-8"))
+        _move_screenshot(basename, target)
 
     def run(self, max_frames=None, screenshot=None, auto_stick=None):
         """Open a window and drive the controller.
@@ -508,14 +523,10 @@ class GenoViewerApp:  # pragma: no cover - requires a display
                 # directory and ignores any directory in the name, so it is
                 # taken under its basename and moved afterwards. Without this
                 # a path like /tmp/shot.png silently lands in the repo root.
-                target = os.path.abspath(screenshot)
-                os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-                basename = os.path.basename(target)
+                basename = os.path.basename(screenshot)
                 rl.take_screenshot(basename.encode("utf-8"))
-                written = os.path.join(os.getcwd(), basename)
-                if os.path.abspath(written) != target and os.path.isfile(written):
-                    os.replace(written, target)
-                print(f"wrote {target}")
+                _move_screenshot(basename, screenshot)
+                print(f"wrote {os.path.abspath(screenshot)}")
         finally:
             character.unload()
             rl.unload_model(ground_model)
