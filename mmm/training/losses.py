@@ -51,6 +51,7 @@ class LossWeights:
     position: float = 1.0
     velocity: float = 1.0
     root: float = 1.0
+    hips_height: float = 1.0
     contact: float = 0.1
     residual: float = 0.0
 
@@ -60,6 +61,7 @@ class LossWeights:
             "position": self.position,
             "velocity": self.velocity,
             "root": self.root,
+            "hips_height": self.hips_height,
             "contact": self.contact,
             "residual": self.residual,
         }
@@ -183,11 +185,22 @@ class PoseLoss:
         else:
             l_vel = predicted.new_zeros(())
 
-        # Root velocity, plus the hips height, which is the other part of the
-        # root state the pose carries.
-        l_root = (pred_root - true_root).abs().mean() + (
-            pred_height - true_height
-        ).abs().mean() / self.position_scale
+        # Root velocity and hips height, as two separate terms.
+        #
+        # They used to be summed into one. That was a mistake, and a costly
+        # one: velocity carries numbers around 27 (cm/s) while the height
+        # carries about 0.8 (centimetres over `position_scale`), a ratio of
+        # 33 to 1. `calibrate` then sized the single weight from the combined
+        # magnitude, which velocity dominates, and the height half was scaled
+        # down with it. Measured on the first trained run, a 10 cm error in
+        # the character's height cost 1.6% of the loss while a 5 cm/s error in
+        # its velocity cost 41%.
+        #
+        # Splitting them lets `calibrate` give each the weight its own scale
+        # deserves. Note this changes what `root` means: it is now velocity
+        # only, so the term is not comparable with runs made before the split.
+        l_root = (pred_root - true_root).abs().mean()
+        l_height = (pred_height - true_height).abs().mean() / self.position_scale
 
         w = self.weights
         total = (
@@ -195,12 +208,14 @@ class PoseLoss:
             + w.position * l_pos
             + w.velocity * l_vel
             + w.root * l_root
+            + w.hips_height * l_height
         )
         terms = {
             "rotation": float(l_rot.detach()),
             "position": float(l_pos.detach()),
             "velocity": float(l_vel.detach()),
             "root": float(l_root.detach()),
+            "hips_height": float(l_height.detach()),
         }
 
         if predicted_contacts is not None and target_contacts is not None:
@@ -230,7 +245,10 @@ class PoseLoss:
         rather than a guess.
         """
         saved = self.weights
-        self.weights = LossWeights(rotation=1.0, position=1.0, velocity=1.0, root=1.0, contact=0.0)
+        self.weights = LossWeights(
+            rotation=1.0, position=1.0, velocity=1.0, root=1.0,
+            hips_height=1.0, contact=0.0,
+        )
         try:
             with torch.no_grad():
                 _, terms = self(predicted, target)
@@ -240,5 +258,5 @@ class PoseLoss:
         reference = max(terms["rotation"], 1e-12)
         return {
             name: reference / max(terms[name], 1e-12)
-            for name in ("rotation", "position", "velocity", "root")
+            for name in ("rotation", "position", "velocity", "root", "hips_height")
         }

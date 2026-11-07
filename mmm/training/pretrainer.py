@@ -593,10 +593,21 @@ class PreTrainer:
             position=suggested["position"],
             velocity=suggested["velocity"],
             root=suggested["root"],
+            hips_height=suggested["hips_height"],
             contact=self.config.loss_weights.contact,
             residual=self.config.loss_weights.residual,
         )
         self._calibrated = True
+
+        if self.distributed.is_main:
+            weights = self.loss_fn.weights.as_dict()
+            print("calibrated loss weights:")
+            for name, value in weights.items():
+                print(f"    {name:12s} {value:10.4f}")
+            # Rewritten now that the weights are known. The first write
+            # happened before training began, when they were still the
+            # placeholder defaults.
+            self._write_manifest()
 
     # -- the loop ---------------------------------------------------------
 
@@ -915,6 +926,17 @@ class PreTrainer:
             "phase": 1,
             "architecture": self.module.describe(),
             "config": self.config.as_dict(),
+            # The weights actually in force, which are NOT the ones in
+            # `config.loss_weights` once `calibrate_weights` is on: those are
+            # only the starting point, and calibration replaces them from a
+            # measurement on the first batch.
+            #
+            # They were recorded nowhere before, which made two runs'
+            # `val_total` incomparable with no sign that anything was wrong --
+            # the weights for an earlier run had to be recovered afterwards by
+            # least squares from its logged per-term history.
+            "loss_weights_effective": self.loss_fn.weights.as_dict(),
+            "loss_weights_calibrated": bool(self._calibrated),
             "device": str(self.device),
             "database": {
                 "fingerprint": database_fingerprint(self.database),
