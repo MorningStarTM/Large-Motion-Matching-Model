@@ -38,6 +38,30 @@ if RAYLIB_AVAILABLE:  # pragma: no cover - requires a display
 
 __all__ = ["ObstacleViewer", "PLACEMENT_HEIGHTS"]
 
+def _move_screenshot(basename: str, target: str) -> None:
+    """Move a raylib screenshot to where the caller actually wanted it.
+
+    raylib ignores any directory in the name and writes relative to the
+    working directory, so every capture has to be moved afterwards.
+
+    `shutil.move`, not `os.replace`: the repository and the output directory
+    are routinely on different drives on Windows, and `os.replace` raises
+    `WinError 17` across devices. That exception used to escape from the
+    per-frame capture and take the whole render loop down after one frame.
+    """
+    import os
+    import shutil
+
+    written = os.path.join(os.getcwd(), basename)
+    if not os.path.isfile(written):
+        return
+    target = os.path.abspath(target)
+    if os.path.abspath(written) == target:
+        return
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    shutil.move(written, target)
+
+
 # Heights the recovery actually found in LaFAN1, so a placed cube is something
 # the database has motion for. See `scripts/recover_obstacles.py` for the table.
 PLACEMENT_HEIGHTS = (20.9, 32.8, 47.3, 66.1, 93.5)
@@ -62,16 +86,45 @@ class ObstacleViewer(ViewerApp):
         **kwargs: passed to `ViewerApp`.
     """
 
-    def __init__(self, database, controller, studio_field=None, **kwargs):
+    def __init__(self, database, controller, studio_field=None,
+                 field=None, **kwargs):
         super().__init__(database, controller, **kwargs)
         self.studio_field = studio_field
+        # Used only when the controller has no field of its own, which is the
+        # case for a model: Phase 1 has no obstacle input, so the boxes are
+        # the viewer's to draw and nobody's to react to.
+        self._own_field = field if field is not None else BoxField()
         self._placed: list[Box] = []
 
     # -- placement --------------------------------------------------------
 
     @property
     def field(self) -> BoxField:
-        return self.controller.field
+        """The obstacles in the scene.
+
+        Normally the controller owns this, so a cube placed here reaches the
+        very next search. A `ModelController` has no field -- Phase 1 has no
+        obstacle input -- so the viewer keeps its own and the boxes are drawn
+        but not reacted to. Falling back rather than failing is deliberate:
+        seeing the character run through a box it cannot perceive is a useful
+        thing to watch, and refusing to draw it would hide that.
+        """
+        field = getattr(self.controller, "field", None)
+        if field is not None:
+            return field
+        return self._own_field
+
+    @field.setter
+    def field(self, value: BoxField) -> None:
+        if hasattr(self.controller, "field"):
+            self.controller.field = value
+        else:
+            self._own_field = value
+
+    @property
+    def controller_sees_obstacles(self) -> bool:
+        """Whether the thing driving the character can perceive the boxes."""
+        return hasattr(self.controller, "field")
 
     def place_ahead(self, height: float) -> Box:
         """Drop a cube in front of the character.
@@ -108,7 +161,7 @@ class ObstacleViewer(ViewerApp):
             self.field.boxes.remove(box)
 
     def clear_placements(self) -> None:
-        self.controller.field = BoxField()
+        self.field = BoxField()
         self._placed = []
 
     def load_studio(self) -> None:
@@ -121,7 +174,7 @@ class ObstacleViewer(ViewerApp):
         """
         if self.studio_field is None:
             return
-        self.controller.field = BoxField(list(self.studio_field))
+        self.field = BoxField(list(self.studio_field))
         self._placed = []
 
     # -- drawing ----------------------------------------------------------
@@ -161,6 +214,12 @@ class ObstacleViewer(ViewerApp):
         on the near edge of the box the character is walking at, the query is
         wrong and no amount of watching the skeleton would reveal it.
         """
+        if not self.controller_sees_obstacles:
+            # Nothing to mark: the marker shows where the *query* says the
+            # support changes, and a controller without an obstacle input
+            # never asks.
+            return
+
         state = self.controller.state
         distance, _ = self.controller.edge_ahead()
         forward = np.asarray(state.forward, np.float64)
@@ -179,6 +238,20 @@ class ObstacleViewer(ViewerApp):
         )
 
     def _draw_obstacle_hud(self) -> None:  # pragma: no cover - needs a display
+        if not self.controller_sees_obstacles:
+            lines = [
+                f"boxes {len(self.field)}   placed {len(self._placed)}",
+                "this controller has NO obstacle input - boxes are drawn only",
+                "1-5 place recovered heights  6 place 150cm",
+                "backspace undo   0 clear   L load studio layout",
+            ]
+            for i, line in enumerate(lines):
+                rl.draw_text(
+                    line, 12, self.config.height - 20 * len(lines) - 12 + i * 20,
+                    18, rl.Color(255, 150, 120, 255),
+                )
+            return
+
         support = self.controller.support_under_character()
         distance, top = self.controller.edge_ahead()
         lines = [
@@ -219,8 +292,19 @@ class ObstacleViewer(ViewerApp):
         if rl.is_key_pressed(rl.KeyboardKey.KEY_L):
             self.load_studio()
 
-    def run(self) -> None:  # pragma: no cover - requires a display
+    def run(self, max_frames=None, screenshot=None, auto_stick=None):
+        """Open a window and drive the controller.
+
+        Args:
+            max_frames: stop after this many frames, for a headless check.
+            screenshot: write a PNG just before stopping.
+            auto_stick: a fixed `(x, z)` stick instead of reading input. A
+                headless run has no player, and with no input a teacher sits
+                on row 0 -- the calibration T-pose -- while a model simply
+                stands still.
+        """
         config = self.config
+        frame = 0
         rl.init_window(config.width, config.height, config.title)
         rl.set_target_fps(config.target_fps)
 
@@ -238,7 +322,18 @@ class ObstacleViewer(ViewerApp):
 
         try:
             while not rl.window_should_close():
-                stick, facing = self._read_stick()
+                if max_frames is not None and frame >= max_frames:
+                    break
+                frame += 1
+
+                if auto_stick is None:
+                    stick, facing = self._read_stick()
+                else:
+                    stick = np.asarray(auto_stick, np.float32)
+                    facing = None
+                    self.camera.update(
+                        np.zeros(2, np.float32), 0.0, self.database.frame_time
+                    )
 
                 if rl.is_key_pressed(rl.KeyboardKey.KEY_SPACE):
                     self._paused = not self._paused
@@ -310,7 +405,13 @@ class ObstacleViewer(ViewerApp):
                 self._draw_obstacle_hud()
                 rl.end_drawing()
 
-                self._previous_positions = positions
+            if screenshot:
+                import os
+
+                basename = os.path.basename(screenshot)
+                rl.take_screenshot(basename.encode("utf-8"))
+                _move_screenshot(basename, screenshot)
+                print(f"wrote {os.path.abspath(screenshot)}")
         finally:
             if self.writer is not None and len(self.writer):
                 manifest = self.writer.close()
