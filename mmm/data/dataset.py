@@ -29,6 +29,7 @@ import numpy as np
 
 from mmm.data import features as feat
 from mmm.data.contacts import detect_contacts
+from mmm.data.contacts_elevated import detect_contacts_any_height
 from mmm.data.database import MotionDatabase
 from mmm.teacher.search import KnnIndex
 
@@ -86,6 +87,7 @@ class WindowDataset:
         seed: int = 0,
         cache_dir: str | None = None,
         use_retrieval: bool = True,
+        elevated_contacts: bool = False,
     ):
         if database.matching.normalization is None:
             raise ValueError("database normalization has not been fitted")
@@ -127,6 +129,7 @@ class WindowDataset:
 
         self.cache_dir = cache_dir
         self.use_retrieval = use_retrieval
+        self.elevated_contacts = elevated_contacts
         self._contacts = self._compute_contacts()
         if use_retrieval:
             self._candidate_next, self._candidate_mask = self._load_or_precompute()
@@ -153,6 +156,14 @@ class WindowDataset:
         root = np.zeros((len(poses), 3), np.float32)
         root[:, 1] = heights
         positions, _ = forward_kinematics(skeleton, matrices, root)
+        if self.elevated_contacts:
+            # `detect_contacts` cannot label a foot planted above about 7 cm,
+            # so on the obstacle clips it marks roughly 40% of frames "not in
+            # contact" while the actor is standing on a prop. This adds those
+            # back; the level-ground labels are untouched.
+            return detect_contacts_any_height(
+                positions, skeleton, self.database.frame_time
+            )
         return detect_contacts(positions, skeleton, self.database.frame_time)
 
     # -- retrieval --------------------------------------------------------

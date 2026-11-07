@@ -25,6 +25,7 @@ import os
 import time
 
 from mmm.data.bvh import load_cached
+from mmm.data.calibration import trim_calibration as trim_calibration_pose
 from mmm.data.database import MotionDatabase
 from mmm.data.skeleton import LOCOMOTION_JOINTS
 
@@ -69,7 +70,8 @@ def find_bvh(root: str, pattern: str = LOCOMOTION_PATTERN) -> list[str]:
     return sorted(found)
 
 
-def _build_signature(paths, pattern, fps, max_frames, full_skeleton) -> dict:
+def _build_signature(paths, pattern, fps, max_frames, full_skeleton,
+                     trim_calibration=False) -> dict:
     """What the built database depends on.
 
     Stored beside it so a cached build is only reused when it was made from the
@@ -82,6 +84,7 @@ def _build_signature(paths, pattern, fps, max_frames, full_skeleton) -> dict:
         "pattern": pattern,
         "fps": fps,
         "max_frames": max_frames,
+        "trim_calibration": bool(trim_calibration),
         "full_skeleton": full_skeleton,
     }
 
@@ -96,6 +99,7 @@ def ensure_database(
     full_skeleton: bool = False,
     rebuild: bool = False,
     verbose: bool = True,
+    trim_calibration: bool = False,
 ) -> str:
     """Return a path to a built database, building it if necessary.
 
@@ -110,6 +114,11 @@ def ensure_database(
         max_frames: truncate each clip, for a quick run. 0 keeps everything.
         full_skeleton: keep all joints instead of the 24 locomotion ones.
         rebuild: build even if a matching database is already there.
+        trim_calibration: drop the leading calibration T-pose from each clip.
+            Every LaFAN1 take opens with the actor standing still with their
+            arms out, 104 to 475 frames of it depending on the clip. Those
+            frames are searchable rows, so a query that lands near one makes
+            the character snap into a T-pose mid-game.
 
     Returns:
         The database directory.
@@ -137,7 +146,9 @@ def ensure_database(
             "Pass --pattern '*' to take every clip."
         )
 
-    signature = _build_signature(paths, pattern, fps, max_frames, full_skeleton)
+    signature = _build_signature(
+        paths, pattern, fps, max_frames, full_skeleton, trim_calibration
+    )
     signature_path = os.path.join(out_dir, "build_signature.json")
 
     if not rebuild and looks_like_database(out_dir) and os.path.isfile(signature_path):
@@ -160,6 +171,7 @@ def ensure_database(
         print(f"building database from {len(paths)} clips matching {pattern!r}")
 
     motions = []
+    trimmed_total = 0
     started = time.time()
     for path in paths:
         motion = load_cached(path, cache_dir, rebuild=rebuild)
@@ -167,6 +179,9 @@ def ensure_database(
             motion = motion.subset(LOCOMOTION_JOINTS)
         if abs(motion.fps - fps) > 1e-6:
             motion = motion.resample(fps)
+        if trim_calibration:
+            motion, dropped = trim_calibration_pose(motion)
+            trimmed_total += dropped
         if max_frames and motion.n_frames > max_frames:
             name = motion.name
             motion = motion.slice(0, max_frames)
@@ -174,6 +189,12 @@ def ensure_database(
         motions.append(motion)
         if verbose:
             print(f"  {motion.name:24} {motion.n_frames:7d} frames")
+
+    if trim_calibration and verbose:
+        print(
+            f"  dropped {trimmed_total:,} leading calibration frames "
+            f"({trimmed_total / fps:.0f}s) across {len(motions)} clips"
+        )
 
     database = MotionDatabase.build(motions, source="lafan1_resolved")
     database.save(out_dir)
