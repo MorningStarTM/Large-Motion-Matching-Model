@@ -256,3 +256,12 @@ engine/build/
 # the same slip that once made a bare `data/` ignore the whole mmm/data
 # source package.
 /tests/
+
+# Jupyter notebooks. These are generated: both Phase reports are built by a
+# script and rebuilt whenever a run is added, so the committed copy would be
+# stale within a day. An executed notebook also stores its outputs inline --
+# base64 PNGs of every figure -- which churns the diff on every run and
+# bloats the history for something reproducible in one command.
+#
+# notebooks/README.md is tracked and stays tracked: this only matches .ipynb.
+notebooks/*.ipynb
