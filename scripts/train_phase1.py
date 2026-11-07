@@ -93,6 +93,25 @@ def parse_args(argv=None):
     paths.add_argument("--cache-dir", default="", help="BVH and retrieval caches")
     paths.add_argument("--run-name", default="phase1")
 
+    data = parser.add_argument_group("data cleaning")
+    data.add_argument(
+        "--trim-calibration",
+        action="store_true",
+        help="drop the leading calibration T-pose from every clip. LaFAN1 "
+        "takes open with the actor standing still, arms out, for 104 to 475 "
+        "frames; those are searchable rows, so a query landing near one makes "
+        "the character snap into a T-pose. About 15,000 frames across the 77 "
+        "clips.",
+    )
+    data.add_argument(
+        "--elevated-contacts",
+        action="store_true",
+        help="label a foot planted at any height, not only below 7 cm. The "
+        "default detector cannot see a foot standing on a prop, so on the "
+        "obstacle clips it marks roughly 40%% of frames 'not in contact' "
+        "while the actor is on a box. Level-ground labels are unchanged.",
+    )
+
     windows = parser.add_argument_group("windows")
     windows.add_argument("--window", type=int, default=64)
     windows.add_argument("--stride", type=int, default=32)
@@ -276,6 +295,7 @@ def main(argv=None) -> int:
         full_skeleton=args.full_skeleton,
         rebuild=args.rebuild_database,
         verbose=main_rank,
+        trim_calibration=args.trim_calibration,
     )
     if main_rank:
         distributed.barrier()
@@ -291,6 +311,7 @@ def main(argv=None) -> int:
         leave_one_clip_out=not args.no_leave_one_clip_out,
         seed=args.seed,
         use_retrieval=args.use_retrieval,
+        elevated_contacts=args.elevated_contacts,
         # Never beside the database: on Kaggle that can be a read only mount.
         cache_dir=workspace.cache,
     )

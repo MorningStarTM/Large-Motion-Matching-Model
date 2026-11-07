@@ -42,6 +42,7 @@ from mmm.obstacles.controller import ObstacleController
 from mmm.obstacles.database import augment, load_fields
 from mmm.obstacles.geometry import Box, BoxField
 from mmm.teacher.controller import KnnController
+from mmm.viewer import session as session_wiring
 
 # Obstacle clips first, so the database is dominated by frames that have
 # something to retrieve, plus level locomotion so ordinary walking still works.
@@ -274,6 +275,18 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--log", default=None, help="write a rollout log")
     parser.add_argument(
+        "--viewer-frames", type=int, default=None,
+        help="stop the viewer after this many frames, for a headless check",
+    )
+    parser.add_argument(
+        "--viewer-screenshot", default=None, help="write a PNG before exiting"
+    )
+    parser.add_argument(
+        "--viewer-walk", action="store_true",
+        help="drive forward instead of reading input; use with --viewer-frames",
+    )
+    session_wiring.add_arguments(parser)
+    parser.add_argument(
         "--search-interval", type=int, default=10, help="frames between searches"
     )
     parser.add_argument("--k", type=int, default=4, help="candidates retrieved")
@@ -289,9 +302,20 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
 
-    database, augmented, motions, studio = build(
-        args.bvh_dir, args.clips, args.max_frames, args.layout
-    )
+    # A model retrieves nothing, so the Matching Database it would search is
+    # never read. Building it anyway cost 23 seconds of startup against 3 for
+    # the one clip the seed pose comes from, so the model takes the short
+    # path. Measured, not assumed.
+    if args.model:
+        database, studio = session_wiring.load_model_scene(
+            args.bvh_dir, args.clips, args.max_frames, args.layout
+        )
+        augmented, motions = database, database.motions
+        print(f"model scene: {database}")
+    else:
+        database, augmented, motions, studio = build(
+            args.bvh_dir, args.clips, args.max_frames, args.layout
+        )
     print(f"studio layout in scene: {studio!r}")
 
     if args.compare:
@@ -302,17 +326,27 @@ def main(argv=None) -> int:
         controller_kwargs["transition_cost"] = args.transition_cost
 
     field = BoxField(list(studio)) if args.studio else BoxField()
-    controller = ObstacleController(augmented, field=field, **controller_kwargs)
+    controller, drawn, description = session_wiring.build_controller(
+        args, database, augmented, field, controller_kwargs
+    )
+    print(f"driven by: {description}")
 
     from mmm.obstacles.viewer import ObstacleViewer
     from mmm.viewer.app import ViewerConfig
 
+    title = (
+        "MMM - trained model" if args.model
+        else "MMM - obstacle aware KNN motion matching"
+    )
     viewer = ObstacleViewer(
-        augmented,
+        drawn,
         controller,
         studio_field=studio,
-        config=ViewerConfig(title="MMM - obstacle aware KNN motion matching"),
-        log_path=args.log,
+        field=field,
+        config=ViewerConfig(title=title),
+        # The rollout log records a teacher's retrieval decisions, which a
+        # model does not make. --record is the model's equivalent.
+        log_path=None if args.model else args.log,
     )
     print(
         "\ncontrols: WASD or stick to move, mouse to turn.\n"
@@ -323,7 +357,11 @@ def main(argv=None) -> int:
         "  backspace undo    0 clear    C candidates    T trajectory\n"
         "  F contacts    space pause    M release mouse\n"
     )
-    viewer.run()
+    viewer.run(
+        max_frames=args.viewer_frames,
+        screenshot=args.viewer_screenshot,
+        auto_stick=(0.0, 1.0) if args.viewer_walk else None,
+    )
     return 0
 
 

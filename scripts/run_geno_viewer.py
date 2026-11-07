@@ -36,6 +36,7 @@ from mmm.obstacles.controller import ObstacleController
 from mmm.obstacles.database import augment
 from mmm.obstacles.geometry import BoxField
 from mmm.teacher.controller import KnnController
+from mmm.viewer import session as session_wiring
 
 from scripts.run_obstacle_teacher import DEFAULT_CLIPS, build
 
@@ -79,10 +80,13 @@ def main(argv=None) -> int:
     parser.add_argument("--search-interval", type=int, default=10)
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--transition-cost", type=float, default=None)
+    session_wiring.add_arguments(parser)
     parser.add_argument(
-        "--model",
+        "--character",
         default=None,
-        help="path to Geno.bin; defaults to the copy in mmm/viewer/geno/resources",
+        help="path to Geno.bin; defaults to the copy in "
+        "mmm/viewer/geno/resources. Renamed from --model, which now means "
+        "the trained checkpoint.",
     )
 
     args = parser.parse_args(argv)
@@ -94,22 +98,36 @@ def main(argv=None) -> int:
             "ground. Run scripts/recover_obstacles.py to produce it."
         )
 
-    database, augmented, motions, studio = build(
-        args.bvh_dir, args.clips, args.max_frames, layout
-    )
+    # A model retrieves nothing, so the Matching Database it would search is
+    # never read. Building it anyway cost 23 seconds of startup against 3 for
+    # the one clip the seed pose comes from, so the model takes the short
+    # path. Measured, not assumed.
+    if args.model:
+        database, studio = session_wiring.load_model_scene(
+            args.bvh_dir, args.clips, args.max_frames, layout
+        )
+        augmented, motions = database, database.motions
+        print(f"model scene: {database}")
+    else:
+        database, augmented, motions, studio = build(
+            args.bvh_dir, args.clips, args.max_frames, layout
+        )
 
     kwargs = {"search_interval": args.search_interval, "k": args.k}
     if args.transition_cost is not None:
         kwargs["transition_cost"] = args.transition_cost
 
-    if args.no_obstacles:
+    if args.no_obstacles and not args.model:
         controller = KnnController(database, **kwargs)
         field = BoxField()
         drawn = database
+        description = "KNN teacher (no obstacles)"
     else:
         field = BoxField(list(studio)) if args.studio else BoxField()
-        controller = ObstacleController(augmented, field=field, **kwargs)
-        drawn = augmented
+        controller, drawn, description = session_wiring.build_controller(
+            args, database, augmented, field, kwargs
+        )
+    print(f"driven by: {description}")
 
     from mmm.viewer.geno.app import GenoViewerApp, GenoViewerConfig
 
@@ -120,7 +138,11 @@ def main(argv=None) -> int:
         title="MMM - Geno viewer",
     )
     viewer = GenoViewerApp(
-        drawn, controller, field=field, config=config, model_path=args.model
+        drawn,
+        controller,
+        field=field,
+        config=config,
+        model_path=args.character,
     )
 
     if args.frames is None:
