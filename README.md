@@ -38,6 +38,37 @@ candidates as context; the model runs every frame.
 | 2 | Distill from KNN | SFT plus DAgger |
 | 3 | RL polish | PPO or direct gradient, KNN in the loop |
 
+## Running the simulators
+
+Two simulators, each drivable either by the **KNN teacher** (classic motion
+matching, playing back real mocap) or by the **trained model** (generating
+every frame). Four combinations, one command each.
+
+**Wireframe** — stick figure, retrieval candidates, trajectory and contacts.
+Use it to see what the search is doing.
+
+```
+python scripts/run_obstacle_teacher.py --studio
+python scripts/run_obstacle_teacher.py --studio --model runs/phase_1_v1/published.safetensors --model-manifest runs/phase_d/manifest.json
+```
+
+**Geno** — skinned character with shadows and ambient occlusion. Use it to
+judge whether the motion looks right: foot sliding and ground penetration are
+nearly invisible on a stick figure and obvious on a shaded character.
+
+```
+python scripts/run_geno_viewer.py --studio
+python scripts/run_geno_viewer.py --studio --model runs/phase_1_v1/published.safetensors --model-manifest runs/phase_d/manifest.json
+```
+
+WASD and the mouse to drive, `space` to pause, `M` to release the cursor. In
+the wireframe viewer `1`-`5` place obstacles at heights recovered from the
+mocap. `--studio` loads the 31 recovered surfaces; leave it off for a bare
+floor.
+
+Full reference, including every key, `--root-source`, headless rendering and
+troubleshooting: **[docs/simulators.md](docs/simulators.md)**.
+
 ## Main claim
 
 Hold 10 of the 100STYLE styles out of all training, add them to the knowledge
@@ -68,14 +99,28 @@ the plan it comes from.
 
 ## Status
 
-Scaffold. Nothing implemented yet. Next milestone is **Phase 0**: BVH loading,
-the 27-dimensional matching features, NumPy KNN search, then wiring it into the
-viewer with joystick, trajectory and inertialization.
+**Phase 0 complete.** BVH loading, the 27-dimensional matching features, KNN
+search, the spring damper, inertialization and two interactive viewers. Plus
+an additive extension that recovers the physical obstacles LaFAN1 was captured
+with and feeds them to the search: 31 surfaces recovered, agreeing across
+clips to a median of 1.42 cm, which cuts foot penetration into a box from
+40.8 cm to 15.7 cm.
+
+**Phase 1 trained.** A 1.8M parameter Mamba policy, 50 epochs on all 77 clips.
+It tracks requested speed well and beats every degenerate baseline, but its
+joint-angle accuracy is weak — see the notebooks below. It can be driven in
+either viewer with `--model`.
+
+**Phase 2 (distill from KNN) is next**, and is where retrieval becomes
+load-bearing in the model's input.
 
 ## Documentation
 
+- [docs/simulators.md](docs/simulators.md) — running both simulators, with
+  and without a trained model
 - [docs/research-plan.md](docs/research-plan.md) — the full plan, cited by
   section number throughout the code
+- [notebooks/](notebooks/) — the Phase 1 and Phase D training reports
 - [docs/decisions/](docs/decisions/) — decision records
 - [engine/README.md](engine/README.md) — the C++ engine and its freeze rule
 
