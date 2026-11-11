@@ -35,6 +35,25 @@ slide. `"animation"` here means the model's prediction owns both, which is the
 honest test of whether it learned to turn -- and, on the Phase 1 checkpoint,
 the setting most likely to wander, since nothing in pre-training rewarded
 following a joystick.
+
+Retrieval, for a Phase 2 model
+-------------------------------
+A Phase 1 checkpoint's policy never reads candidates; a Phase 2 one always
+does -- `MmmPolicy.step` raises if `use_retrieval` is set and none are given.
+So once the model itself is driving, *something* has to search the database
+on its behalf, the same way `KnnController` does for the teacher. Passing
+`database` (and optionally a prebuilt `index`) turns that on: every
+`search_interval` frames this builds a query from the model's own current
+state -- the same features `mmm.data.features.build_query` assembles for the
+teacher -- searches, and holds the result in between, exactly
+`KnnController`'s own convention.
+
+One simplification against the teacher's own search: foot velocities enter
+the query as zero rather than tracked frame to frame. `reference_pose`
+already treats that as an acceptable default when a caller omits it --
+"biases retrieval towards planted feet" -- and tracking it here would mean a
+second, parallel implementation of `KnnController._track_velocities` for a
+term the search can do without.
 """
 
 from __future__ import annotations
@@ -177,6 +196,24 @@ class ModelController:
         root_source: "hybrid", "simulation" or "animation"; see the module
             docstring.
         trajectory: the spring damper. One is built if not given.
+        database: required when `policy.spec.use_retrieval` is set -- a
+            Phase 2 policy -- so this can search on the model's own behalf.
+            Ignored for a Phase 1 policy, which never reads the result.
+        index: a prebuilt `KnnIndex` over `database`. Built fresh if not
+            given; pass one in to share it across several controllers rather
+            than rebuilding the same KD-tree for each.
+        search_interval: frames between searches, held in between. The same
+            default `KnnController` uses, so a Phase 2 model sees retrieval
+            at the cadence it was trained on.
+        k: candidates retrieved per search. Must match the policy's
+            `n_candidates`, and this raises if it does not, since a silent
+            mismatch would either crash deeper in `MmmPolicy.build_input` or,
+            worse, truncate silently.
+        exclude_clips: clip ids the search may not return. The one reason a
+            caller would ever set this by hand is a DAgger round deliberately
+            evaluating a student against a teacher that cannot retrieve its
+            own very recent corrections; `scripts/dagger_round.py` does not,
+            since nothing here was trained to retrieve from its own output.
     """
 
     def __init__(
@@ -188,6 +225,11 @@ class ModelController:
         device: str = "cpu",
         root_source: str = "hybrid",
         trajectory: TrajectoryPredictor | None = None,
+        database=None,
+        index=None,
+        search_interval: int = 10,
+        k: int = 4,
+        exclude_clips=None,
     ):
         if root_source not in ("hybrid", "simulation", "animation"):
             raise ValueError(
@@ -204,6 +246,22 @@ class ModelController:
                 "pose layouts."
             )
 
+        if policy.spec.use_retrieval:
+            if database is None:
+                raise ValueError(
+                    "this policy was built with use_retrieval=True, so it "
+                    "needs a database to search -- pass database=... (and "
+                    "optionally a prebuilt index=...)."
+                )
+            if k != policy.spec.n_candidates:
+                raise ValueError(
+                    f"k={k} does not match the policy's n_candidates="
+                    f"{policy.spec.n_candidates}. A search returning the "
+                    "wrong number of candidates either crashes inside "
+                    "MmmPolicy.build_input or silently truncates; neither is "
+                    "what you want."
+                )
+
         self.policy = policy
         self.skeleton = skeleton
         self.n_joints = skeleton.n_joints
@@ -216,6 +274,16 @@ class ModelController:
         self.right_foot = skeleton.index(RIGHT_FOOT)
         self.hips = skeleton.index(HIPS)
 
+        self.database = database
+        self.search_interval = search_interval
+        self.k = k
+        self.exclude_clips = set(exclude_clips or ())
+        self.index = None
+        if database is not None:
+            from mmm.teacher.search import KnnIndex
+
+            self.index = index if index is not None else KnnIndex(database)
+
         self.trajectory = (
             trajectory
             if trajectory is not None
@@ -227,6 +295,9 @@ class ModelController:
         self._hidden = None
         self._previous_pose = None
         self._start_height = 0.0
+        self._frames_since_search = 0
+        self._held_candidates: torch.Tensor | None = None
+        self._held_mask: torch.Tensor | None = None
         self.reset()
 
     # -- construction -----------------------------------------------------
@@ -244,12 +315,13 @@ class ModelController:
         policy, architecture, _ = load_policy_from_manifest(
             checkpoint, manifest=manifest, device=device
         )
-        if architecture.get("use_retrieval"):
+        if architecture.get("use_retrieval") and kwargs.get("database") is None:
             raise ValueError(
                 f"{checkpoint} was trained with retrieval in its input, so it "
-                "needs candidate poses this controller does not supply. That "
-                "is a Phase 2 checkpoint; drive it with a controller that "
-                "carries a database."
+                "needs candidate poses from somewhere -- pass database=... "
+                "(and optionally index=...) so this controller can search on "
+                "the model's own behalf, the same way KnnController does for "
+                "the teacher."
             )
         return cls(policy, skeleton, seed_pose, device=device, **kwargs)
 
@@ -288,6 +360,18 @@ class ModelController:
         self._hidden = None
         self.trajectory.reset() if hasattr(self.trajectory, "reset") else None
 
+        # Mirrors KnnController: a fresh frame count means the next *held*
+        # interval starts counting from here. The held candidates themselves
+        # are cleared too, which forces a search on the very first step
+        # regardless of search_interval -- unlike KnnController, which can
+        # legitimately run several frames before its first search, a
+        # retrieval policy cannot take a single step without something to
+        # read, so there must never be a gap before the first search.
+        self._frames_since_search = 0
+        self._held_candidates = None
+        self._held_mask = None
+        self._last_query = None
+
     # -- the loop ---------------------------------------------------------
 
     def _joystick(self, state: ControllerState) -> np.ndarray:
@@ -307,6 +391,58 @@ class ModelController:
             ]
         ).astype(np.float32)
 
+    def _search_if_due(self, state: ControllerState, desired_positions, desired_directions):
+        """Refresh the held candidates if it is time, or if there are none yet.
+
+        Builds the query from exactly the quantities `KnnController._current_query`
+        would use for the teacher -- except foot velocities, which are zero
+        here; see the module docstring for why that is an acceptable
+        simplification rather than an oversight.
+
+        Returns:
+            `(searched, result)` -- whether a search happened this frame, and
+            the `SearchResult` if so, else `None`. `self._held_candidates`
+            and `self._held_mask` are updated in place when it does.
+        """
+        if self.database is None:
+            return False, None
+
+        due = self._held_candidates is None or self._frames_since_search >= self.search_interval
+        if not due:
+            return False, None
+
+        local_positions = self.character_space_positions(state)
+        foot_positions = np.stack(
+            [local_positions[self.left_foot], local_positions[self.right_foot]]
+        )
+        foot_velocities = np.zeros((2, 3), np.float32)
+
+        query = feat.build_query(
+            foot_positions=foot_positions,
+            foot_velocities=foot_velocities,
+            hip_velocity=state.linear_velocity,
+            desired_positions=desired_positions,
+            desired_directions=desired_directions,
+        )
+        normalized = self.database.matching.normalization.apply(query)
+        result = self.index.query(normalized, k=self.k, exclude_clips=self.exclude_clips or None)
+
+        # A search can return fewer than k rows -- every row of a database
+        # too small, or every nearby row excluded. Padded with zero poses and
+        # a zero mask, the same convention MmmPolicy.build_input already
+        # applies to a masked-out candidate elsewhere, rather than crashing
+        # on a width mismatch several lines later.
+        poses = np.zeros((self.k, self.policy.spec.pose_dim), np.float32)
+        mask = np.zeros(self.k, np.float32)
+        poses[: len(result.rows)] = self.database.animation.poses[result.rows]
+        mask[: len(result.rows)] = 1.0
+
+        self._held_candidates = torch.from_numpy(poses).to(self.device)[None]
+        self._held_mask = torch.from_numpy(mask).to(self.device)[None]
+        self._frames_since_search = 0
+        self._last_query = query
+        return True, result
+
     @torch.no_grad()
     def step(self, stick: np.ndarray, facing_stick=None) -> StepRecord:
         """Advance one frame.
@@ -316,17 +452,30 @@ class ModelController:
             facing_stick: `(2,)` optional separate facing request.
 
         Returns:
-            A `StepRecord` with the generated pose. `searched`, `jumped` and
-            `candidates` are always empty -- nothing is retrieved -- so an
-            overlay written for the teacher draws no candidates rather than
-            breaking.
+            A `StepRecord` with the generated pose. For a Phase 1 policy
+            (`self.database is None`), `searched`, `jumped` and `candidates`
+            are always empty -- nothing is retrieved -- so an overlay written
+            for the teacher draws no candidates rather than breaking. For a
+            Phase 2 policy, `searched`/`candidates`/`distances`/`chosen_row`
+            describe the self-search this frame used or held, the same shape
+            `KnnController` returns them in.
         """
         state = self.state
         self.trajectory.update(stick, facing_stick)
+        desired_positions, desired_directions = self.trajectory.predict(state.forward)
 
-        joystick = torch.from_numpy(self._joystick(state)).to(self.device)[None]
+        searched, result = self._search_if_due(state, desired_positions, desired_directions)
+        self._frames_since_search += 1
+
+        joystick_vector = np.concatenate(
+            [
+                np.asarray(desired_positions, np.float32).reshape(-1),
+                np.asarray(desired_directions, np.float32).reshape(-1),
+            ]
+        ).astype(np.float32)
+        joystick = torch.from_numpy(joystick_vector).to(self.device)[None]
         pose_tensor, contact_logits, self._hidden = self.policy.step(
-            joystick, self._previous_pose, state=self._hidden
+            joystick, self._previous_pose, self._held_candidates, self._held_mask, state=self._hidden
         )
         # Fed straight back in next frame. This is the whole difference from
         # the teacher: there is no ground truth to fall back on, so an error
@@ -358,12 +507,12 @@ class ModelController:
             local_rotations=state.local_rotations,
             origin=state.origin.copy(),
             forward=state.forward.copy(),
-            searched=False,
+            searched=searched,
             jumped=False,
-            query=None,
-            candidates=None,
-            distances=None,
-            chosen_row=-1,
+            query=self._last_query if searched else None,
+            candidates=result.rows if result is not None else None,
+            distances=result.distances if result is not None else None,
+            chosen_row=result.best if result is not None else -1,
         )
 
     def _integrate_root(self, state: ControllerState) -> None:
