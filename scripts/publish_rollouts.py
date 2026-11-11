@@ -88,48 +88,68 @@ def main(argv=None) -> int:
     print(f"dataset-id : {args.dataset_id}  ({'private' if args.private else 'public'})")
 
     # The Kaggle API uploads a folder by reading a dataset-metadata.json
-    # inside it, rather than taking the slug as an argument -- written here,
-    # into the rollout directory itself, right next to the shards and
-    # collection_summary.json it is already publishing.
+    # inside it, rather than taking the slug as an argument. `--dir` is often
+    # someone else's notebook output added as a data source -- mounted under
+    # /kaggle/input, which is read-only -- so the metadata is written into a
+    # separate, writable staging folder instead of the source directory
+    # itself. The shard files are symlinked in rather than copied: they can
+    # be gigabytes, and the Kaggle API only reads them to zip, which follows
+    # a symlink exactly like a real file.
     metadata = {
         "title": title,
         "id": args.dataset_id,
         "licenses": [{"name": "CC0-1.0"}],
     }
-    metadata_path = os.path.join(args.dir, "dataset-metadata.json")
 
     if args.dry_run:
-        print(f"\nwould write {metadata_path}:")
+        print(f"\nwould stage and upload with this dataset-metadata.json:")
         print(json.dumps(metadata, indent=2))
         print("\ndry run: nothing was uploaded.")
         return 0
 
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
+    import shutil
+    import tempfile
 
-    from kaggle.api.kaggle_api_extended import KaggleApi
-
-    api = KaggleApi()
+    staging = tempfile.mkdtemp(prefix="mmm_publish_rollouts_")
     try:
-        api.authenticate()
-    except Exception as error:  # noqa: BLE001 - the kaggle package raises several types
-        print(
-            f"not authenticated ({error}). Set KAGGLE_USERNAME and KAGGLE_KEY, "
-            "or place a kaggle.json at ~/.kaggle/kaggle.json.",
-            file=sys.stderr,
-        )
-        return 1
+        with open(os.path.join(staging, "dataset-metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+        for name in os.listdir(args.dir):
+            source = os.path.join(args.dir, name)
+            if os.path.isfile(source):
+                link = os.path.join(staging, name)
+                try:
+                    os.symlink(os.path.abspath(source), link)
+                except OSError:
+                    # No symlink permission (seen on some Windows setups) --
+                    # fall back to a real copy, the only other option.
+                    shutil.copy2(source, link)
 
-    if args.new:
-        api.dataset_create_new(
-            folder=args.dir, convert_to_csv=False, dir_mode="zip",
-            public=not args.private,
-        )
-    else:
-        api.dataset_create_version(
-            folder=args.dir, version_notes=args.message or "updated rollouts",
-            convert_to_csv=False, dir_mode="zip",
-        )
+        from kaggle.api.kaggle_api_extended import KaggleApi
+
+        api = KaggleApi()
+        try:
+            api.authenticate()
+        except Exception as error:  # noqa: BLE001 - the kaggle package raises several types
+            print(
+                f"not authenticated ({error}). Set KAGGLE_USERNAME and KAGGLE_KEY, "
+                "or place a kaggle.json at ~/.kaggle/kaggle.json.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.new:
+            api.dataset_create_new(
+                folder=staging, convert_to_csv=False, dir_mode="zip",
+                public=not args.private,
+            )
+        else:
+            api.dataset_create_version(
+                folder=staging, version_notes=args.message or "updated rollouts",
+                convert_to_csv=False, dir_mode="zip",
+            )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     print(f"\nhttps://www.kaggle.com/datasets/{args.dataset_id}")
     return 0

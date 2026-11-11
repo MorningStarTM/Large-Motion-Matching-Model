@@ -170,6 +170,17 @@ def parse_args(argv=None):
         "useful for resuming, so it is off by default.",
     )
     parser.add_argument("--revision", default="", help="branch to push to")
+    parser.add_argument(
+        "--subfolder",
+        default="",
+        help="upload under this folder inside the repo instead of the repo "
+        "root, e.g. 'phase1_v1'. Lets several versions of a checkpoint "
+        "(v1, v2, a Phase 2 round, ...) live as folders in one repo -- "
+        "'ErnestBeckham/MMM-versions' -- rather than needing a separate "
+        "repo per version. The model card is still written and uploaded "
+        "per version, at '<subfolder>/README.md', since each version's "
+        "architecture and metrics differ.",
+    )
     parser.add_argument("--message", default="", help="commit message")
     parser.add_argument(
         "--dry-run",
@@ -355,11 +366,15 @@ def main(argv=None) -> int:
         if os.path.exists(candidate):
             uploads.append((candidate, extra))
 
+    subfolder = args.subfolder.strip("/")
     print(f"\nrepository : {args.repo_id}  ({'PUBLIC' if args.public else 'private'})")
+    if subfolder:
+        print(f"subfolder  : {subfolder}/")
     print("files      :")
     for source, name in uploads:
         size = os.path.getsize(source) / 1e6 if source else len(card) / 1e6
-        print(f"  {name:22} {size:8.2f} MB")
+        path_in_repo = f"{subfolder}/{name}" if subfolder else name
+        print(f"  {path_in_repo:30} {size:8.2f} MB")
 
     # Write the card beside the checkpoint whatever happens next. A dry run is
     # the natural way to produce it for a manual upload, and an upload that
@@ -408,18 +423,20 @@ def main(argv=None) -> int:
         uploads = [entry for entry in uploads if entry[1] != "README.md"]
 
     for source, name in uploads:
+        path_in_repo = f"{subfolder}/{name}" if subfolder else name
         api.upload_file(
             path_or_fileobj=source or card_path,
-            path_in_repo=name,
+            path_in_repo=path_in_repo,
             repo_id=args.repo_id,
             repo_type="model",
             revision=args.revision or None,
             commit_message=args.message
             or f"Phase {metadata.get('phase', 1)} checkpoint, epoch {metadata.get('epoch')}",
         )
-        print(f"uploaded {name}")
+        print(f"uploaded {path_in_repo}")
 
-    print(f"\nhttps://huggingface.co/{args.repo_id}")
+    url = f"https://huggingface.co/{args.repo_id}"
+    print(f"\n{url}" + (f"/tree/main/{subfolder}" if subfolder else ""))
     return 0
 
 
