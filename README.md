@@ -258,6 +258,8 @@ jumped this frame.
 
 ## Training
 
+### Phase 1: pretrain on mocap
+
 ```
 python scripts/train_phase1.py --dataset data/bvh/bvh --pattern "*" --epochs 50 --batch-size 16 --lr-scale linear --trim-calibration --elevated-contacts --out runs/phase_e
 ```
@@ -274,6 +276,56 @@ Two data flags, both off by default:
 
 `notebooks/phase1_report.ipynb` reads the results and compares runs side by
 side.
+
+### Phase 2: SFT, then DAgger
+
+Phase 2 teaches a Phase 1 checkpoint to use retrieval, by first copying the
+KNN teacher's behaviour (SFT), then correcting the model's own mistakes
+rather than ones it never makes (DAgger). Four commands, run in this order:
+
+1. **Collect round 1** — the teacher drives itself with a synthetic
+   joystick; every frame is logged.
+
+   ```
+   python scripts/collect_teacher_data.py --dataset data/bvh/bvh --frames 1000000 --out runs/rollouts/round1
+   ```
+
+2. **SFT** — train the retrieval-extended policy on round 1 alone.
+
+   ```
+   python scripts/train_phase2.py --dataset data/bvh/bvh --rollouts runs/rollouts/round1 --phase1-checkpoint runs/phase1/published.safetensors --out runs/phase2
+   ```
+
+3. **A DAgger round** — the *student* (the checkpoint from step 2) drives
+   itself; the teacher relabels every frame it actually reaches, mistakes
+   included.
+
+   ```
+   python scripts/dagger_round.py --dataset data/bvh/bvh --checkpoint runs/phase2/best.safetensors --frames 200000 --out runs/rollouts/dagger1
+   ```
+
+4. **Fine-tune on everything so far** — every round's rollouts are passed
+   together; nothing collected earlier is thrown away. `--resume` continues
+   from the previous round's weights; `--phase1-checkpoint` is still
+   required (the Phase 1 handoff always runs first), but `--resume`
+   overwrites every weight it produces, so it doesn't matter that this
+   particular checkpoint is already Phase-2-shaped.
+
+   ```
+   python scripts/train_phase2.py --dataset data/bvh/bvh --rollouts runs/rollouts/round1 runs/rollouts/dagger1 --phase1-checkpoint runs/phase1/published.safetensors --resume runs/phase2/best.safetensors --epochs 10 --out runs/phase2_round1
+   ```
+
+Repeat steps 3 and 4 for each further round, pointing `--checkpoint` /
+`--resume` at the newest checkpoint and adding that round's output directory
+to `--rollouts` each time. `--dataset`, `--pattern`, `--max-frames` and
+`--trim-calibration` must match across every command in this section —
+`ensure_database` caches by exactly those inputs, and every rollout's
+manifest is checked against the resulting fingerprint.
+
+A second run of `collect_teacher_data.py` or `dagger_round.py` with the same
+`--out` resumes rather than overwrites: existing shards are left alone and
+numbering continues after the highest one found, which is what a session
+that hits a time limit (Kaggle, Colab) needs.
 
 ---
 
