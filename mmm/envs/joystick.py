@@ -32,6 +32,17 @@ class JoystickConfig:
     Attributes:
         weights: relative probability of each primitive.
         duration_range: frames each primitive lasts, as (low, high).
+        idle_duration_range: frames an `idle` span lasts. Separate from
+            `duration_range` because idle needs to mean something different
+            from `stop`. `stop` is a transitional blip inside a hold/turn/
+            sprint mix -- the character slows, pauses briefly, moves again --
+            and at `duration_range`'s 30 to 150 frames (0.5 to 2.5s) that is
+            right for a transition. A player who is not touching the stick at
+            all holds that for seconds at a time, often much longer, so idle
+            gets its own, longer range. Without this distinction the dataset
+            has no real "character just standing there" state, only brief
+            pauses between other things, and the model never has to learn
+            that a joystick can mean nothing for a while.
         walk_magnitude: stick magnitude treated as walking.
         run_magnitude: stick magnitude treated as running.
         turn_rate_range: radians per second while turning.
@@ -49,9 +60,11 @@ class JoystickConfig:
             "sprint": 1.5,
             "reverse": 1.0,
             "circle": 1.0,
+            "idle": 1.5,
         }
     )
     duration_range: tuple = (30, 150)
+    idle_duration_range: tuple = (120, 400)
     walk_magnitude: float = 0.45
     run_magnitude: float = 1.0
     turn_rate_range: tuple = (0.5, 2.5)
@@ -96,7 +109,15 @@ class SyntheticJoystick:
         probabilities = np.array([self.config.weights[n] for n in names], dtype=np.float64)
         probabilities /= probabilities.sum()
         self._primitive = str(self.rng.choice(names, p=probabilities))
-        self._remaining = int(self.rng.randint(*self.config.duration_range))
+        # Idle draws its duration from its own, longer range; see
+        # `JoystickConfig.idle_duration_range` for why it needs to differ from
+        # a transitional `stop`.
+        duration_range = (
+            self.config.idle_duration_range
+            if self._primitive == "idle"
+            else self.config.duration_range
+        )
+        self._remaining = int(self.rng.randint(*duration_range))
         self._counts[self._primitive] = self._counts.get(self._primitive, 0) + self._remaining
 
         config = self.config
@@ -108,7 +129,9 @@ class SyntheticJoystick:
         elif self._primitive == "turn":
             self._magnitude = float(self.rng.uniform(config.walk_magnitude, config.run_magnitude))
             self._turn_rate = float(self.rng.uniform(*config.turn_rate_range)) * self.rng.choice([-1, 1])
-        elif self._primitive == "stop":
+        elif self._primitive in ("stop", "idle"):
+            # Mechanically identical to a zero stick -- the distinction is
+            # purely how long it is held, handled above.
             self._magnitude = 0.0
         elif self._primitive == "stop_start":
             # Half the span stopped, then moving again: the stop-start that
