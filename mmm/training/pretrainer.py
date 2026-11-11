@@ -216,10 +216,18 @@ class PreTrainer:
         config: PreTrainerConfig | None = None,
         checkpoint_dir: str = "runs/phase1",
         distributed: DistributedContext | None = None,
+        phase: int = 1,
     ):
         self.config = config or PreTrainerConfig()
         self.database = database
         self.checkpoint_dir = checkpoint_dir
+        # Recorded in the checkpoint and the manifest. The training loop below
+        # is phase-agnostic next-pose prediction either way -- Phase 2 reuses
+        # this class wholesale, pointed at a policy built with
+        # `use_retrieval=True` and a dataset built from teacher rollouts
+        # instead of raw mocap -- so the one thing that has to be told apart
+        # is which phase produced the checkpoint, for anyone reading it later.
+        self.phase = phase
 
         # A single process context behaves as a no-op throughout, so the single
         # GPU path is the same code path rather than a second one.
@@ -852,7 +860,7 @@ class PreTrainer:
             optimizer=self.optimizer if optimizer else None,
             metadata={
                 "epoch": epoch,
-                "phase": 1,
+                "phase": self.phase,
                 "architecture": self.module.describe(),
                 "loss_weights": self.loss_fn.weights.as_dict(),
                 "config": self.config.as_dict(),
@@ -923,7 +931,7 @@ class PreTrainer:
         from mmm.teacher.logger import database_fingerprint
 
         manifest = {
-            "phase": 1,
+            "phase": self.phase,
             "architecture": self.module.describe(),
             "config": self.config.as_dict(),
             # The weights actually in force, which are NOT the ones in
