@@ -77,6 +77,19 @@ def parse_args(argv=None):
         "here, all at once -- nothing is thrown away between rounds.",
     )
     rollouts.add_argument("--elevated-contacts", action="store_true")
+    rollouts.add_argument(
+        "--allow-fingerprint-mismatch",
+        action="store_true",
+        help="skip the check that a rollout was recorded against this exact "
+        "database. Only for rollouts collected before "
+        "mmm.teacher.logger.database_fingerprint started rounding its "
+        "normalization statistics -- those carry a fingerprint computed by "
+        "the old, stricter hash, which a new session's otherwise-identical "
+        "database can never reproduce. Before passing this, confirm by hand "
+        "that collection's --dataset/--pattern/--max-frames/--trim-calibration "
+        "really do match this run's (collection's collection_summary.json "
+        "has them); this flag does not check that for you.",
+    )
     rollouts.add_argument("--k", type=int, default=4, help="used only if no rollout ever searched")
 
     paths = parser.add_argument_group("paths")
@@ -185,12 +198,19 @@ def main(argv=None) -> int:
     database = MotionDatabase.load(database_path)
     say(database)
 
+    if args.allow_fingerprint_mismatch:
+        say(
+            "note: --allow-fingerprint-mismatch is set -- training against "
+            "rollouts without checking they match this database. Make sure "
+            "that's actually true before trusting this run."
+        )
     dataset = RolloutWindowDataset(
         database,
         args.rollouts,
         window=args.window,
         stride=args.stride,
         elevated_contacts=args.elevated_contacts,
+        check_fingerprint=not args.allow_fingerprint_mismatch,
     )
     n_candidates = dataset.n_candidates or args.k
     if dataset.n_candidates and dataset.n_candidates != args.k:
