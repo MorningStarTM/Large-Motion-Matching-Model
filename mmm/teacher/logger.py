@@ -32,6 +32,16 @@ def database_fingerprint(database: MotionDatabase) -> str:
     Covers the row count, the clip list and the normalization, which is enough
     to catch the mistake that matters: training on logs recorded against a
     different database than the one now loaded.
+
+    The normalization mean/std are rounded to 1e-4 before hashing. Collection
+    and training routinely happen in separate sessions -- sometimes separate
+    machines entirely, as with a Kaggle notebook's output consumed from
+    another notebook -- and different BLAS builds or thread counts sum the
+    same rows in a different order, which moves these statistics by noise far
+    smaller than 1e-4 even for byte-identical input data. Hashing the raw
+    bytes would flag that noise as a different database; rounding first keeps
+    the check sensitive to what actually matters -- a different row count,
+    clip list or skeleton -- without false alarms on numerical noise.
     """
     digest = hashlib.sha256()
     digest.update(str(database.n_rows).encode())
@@ -39,8 +49,8 @@ def database_fingerprint(database: MotionDatabase) -> str:
     for clip in database.clips:
         digest.update(f"{clip.name}:{clip.start}:{clip.length}".encode())
     if database.matching.normalization is not None:
-        digest.update(database.matching.normalization.mean.tobytes())
-        digest.update(database.matching.normalization.std.tobytes())
+        digest.update(np.round(database.matching.normalization.mean, 4).tobytes())
+        digest.update(np.round(database.matching.normalization.std, 4).tobytes())
     return digest.hexdigest()[:16]
 
 
