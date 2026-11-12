@@ -320,18 +320,57 @@ def main(argv=None) -> int:
         if not os.path.exists(best):
             print("no best checkpoint to publish", file=sys.stderr)
             return 1
-        trainer.load(best)
-        published = trainer.save(os.path.join(workspace.out, "published"), epoch=None, optimizer=False)
 
-        from publish_checkpoint import main as publish
+        # The whole run folder -- best/last checkpoints, manifest, history,
+        # metrics, run_args -- goes up as one subfolder named after this run,
+        # the same shape `publish_checkpoint.py --subfolder <name>` has been
+        # pushed by hand so far. One subfolder per run keeps every version
+        # (v1's SFT, v1's first DAgger round, v2's SFT, ...) separately
+        # browsable in the same repo instead of needing a repo each.
+        from huggingface_hub import HfApi
 
-        publish_argv = ["--repo-id", args.hf_repo, "--checkpoint", published]
-        if args.hf_public:
-            publish_argv.append("--public")
-        if args.hf_license:
-            publish_argv += ["--license", args.hf_license]
-        print(f"\npublishing {published} to {args.hf_repo}")
-        return publish(publish_argv)
+        from publish_checkpoint import build_card
+        from mmm.training.checkpoints import read_metadata
+
+        subfolder = os.path.basename(os.path.normpath(workspace.out)) or args.run_name
+        metadata = read_metadata(best)
+        history_path = os.path.join(workspace.out, "history.json")
+        history = None
+        if os.path.exists(history_path):
+            with open(history_path, encoding="utf-8") as handle:
+                history = json.load(handle)
+
+        card_args = argparse.Namespace(repo_id=subfolder, license=args.hf_license)
+        card = build_card(card_args, metadata, history, "best.safetensors")
+        with open(os.path.join(workspace.out, "README.md"), "w", encoding="utf-8") as handle:
+            handle.write(card)
+
+        api = HfApi()
+        try:
+            whoami = api.whoami()
+        except Exception as error:  # noqa: BLE001 - the hub raises several types
+            print(
+                f"not authenticated ({error}). Set HF_TOKEN or run "
+                "`huggingface-cli login`.",
+                file=sys.stderr,
+            )
+            return 1
+        say(f"authenticated as {whoami.get('name', '?')}")
+
+        api.create_repo(
+            repo_id=args.hf_repo, repo_type="model",
+            private=not args.hf_public, exist_ok=True,
+        )
+        say(f"\npublishing {workspace.out} to {args.hf_repo}/{subfolder}")
+        api.upload_folder(
+            folder_path=workspace.out,
+            path_in_repo=subfolder,
+            repo_id=args.hf_repo,
+            repo_type="model",
+            commit_message=f"Phase 2 run {subfolder}, epoch {metadata.get('epoch')}",
+        )
+        say(f"\nhttps://huggingface.co/{args.hf_repo}/tree/main/{subfolder}")
+        return 0
 
     return 0
 
