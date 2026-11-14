@@ -230,6 +230,7 @@ class ModelController:
         search_interval: int = 10,
         k: int = 4,
         exclude_clips=None,
+        ablate_retrieval: bool = False,
     ):
         if root_source not in ("hybrid", "simulation", "animation"):
             raise ValueError(
@@ -278,6 +279,13 @@ class ModelController:
         self.search_interval = search_interval
         self.k = k
         self.exclude_clips = set(exclude_clips or ())
+        # For the "with retrieval vs without" comparison the project's plan
+        # calls for (docs/research-plan.md section 4): the search still runs
+        # and StepRecord still reports what it found, but zero candidates go
+        # into the policy instead -- the same ablation PreTrainer._validate
+        # already does for its retrieval_gain metric, just at inference time
+        # on a real rollout rather than inside training.
+        self.ablate_retrieval = ablate_retrieval
         self.index = None
         if database is not None:
             from mmm.teacher.search import KnnIndex
@@ -474,8 +482,12 @@ class ModelController:
             ]
         ).astype(np.float32)
         joystick = torch.from_numpy(joystick_vector).to(self.device)[None]
+        candidates, mask = self._held_candidates, self._held_mask
+        if self.ablate_retrieval and candidates is not None:
+            candidates = torch.zeros_like(candidates)
+            mask = torch.zeros_like(mask)
         pose_tensor, contact_logits, self._hidden = self.policy.step(
-            joystick, self._previous_pose, self._held_candidates, self._held_mask, state=self._hidden
+            joystick, self._previous_pose, candidates, mask, state=self._hidden
         )
         # Fed straight back in next frame. This is the whole difference from
         # the teacher: there is no ground truth to fall back on, so an error

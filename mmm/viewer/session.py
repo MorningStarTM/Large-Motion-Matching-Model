@@ -21,6 +21,8 @@ __all__ = [
     "add_arguments",
     "build_controller",
     "seed_pose_from_database",
+    "checkpoint_architecture",
+    "model_needs_retrieval",
     "DEFAULT_SEED_FRAME",
 ]
 
@@ -65,6 +67,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--device", default="cpu", help="torch device for the policy"
+    )
+    group.add_argument(
+        "--ablate-retrieval", action="store_true",
+        help="for a retrieval (Phase 2) checkpoint only: keep searching so "
+        "the HUD still shows what would be retrieved, but feed the policy "
+        "zero candidates instead of the real ones. For comparing a model "
+        "with and against its own retrieval input, visually, with the same "
+        "checkpoint both times.",
     )
 
 class _EchoRow:
@@ -228,6 +238,36 @@ def seed_pose_from_database(database, frame: int = DEFAULT_SEED_FRAME):
     return np.asarray(database.animation.poses[row], np.float32), int(row)
 
 
+def checkpoint_architecture(checkpoint: str, manifest: str | None = None) -> dict:
+    """A checkpoint's `architecture` block, without loading its weights.
+
+    Decides, before anything else loads, whether a session needs the full
+    `MotionDatabase` (with its KD-tree, for a Phase 2 checkpoint to search)
+    or can take the lightweight `ModelScene` (a Phase 1 checkpoint, which
+    retrieves nothing).
+    """
+    import json
+
+    candidates = [manifest] if manifest else []
+    if checkpoint:
+        candidates.append(os.path.join(os.path.dirname(checkpoint), "manifest.json"))
+    for path in candidates:
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                return (json.load(handle) or {}).get("architecture", {}) or {}
+
+    from mmm.training.checkpoints import read_metadata
+
+    return (read_metadata(checkpoint) or {}).get("architecture", {}) or {}
+
+
+def model_needs_retrieval(checkpoint: str | None, manifest: str | None = None) -> bool:
+    """Whether `--model` names a checkpoint that expects retrieval input."""
+    if not checkpoint:
+        return False
+    return bool(checkpoint_architecture(checkpoint, manifest).get("use_retrieval"))
+
+
 def build_controller(args, database, augmented, field, teacher_kwargs: dict):
     """A teacher or a model controller, by whether `--model` was given.
 
@@ -243,6 +283,34 @@ def build_controller(args, database, augmented, field, teacher_kwargs: dict):
 
     from mmm.models.runtime import ModelController
 
+    architecture = checkpoint_architecture(args.model, args.model_manifest)
+    retrieval = bool(architecture.get("use_retrieval"))
+    extra = {}
+    description_suffix = ""
+
+    if retrieval:
+        if not hasattr(database.matching, "normalized"):
+            raise ValueError(
+                f"{args.model} is a retrieval checkpoint, but the scene has "
+                "no Matching Database to search. The caller should have "
+                "built the full database for this checkpoint, not the "
+                "lightweight model-only scene -- see "
+                "session_wiring.model_needs_retrieval."
+            )
+        from mmm.teacher.search import KnnIndex
+
+        k = teacher_kwargs.get("k", 4)
+        extra = dict(
+            database=database,
+            index=KnnIndex(database),
+            search_interval=teacher_kwargs.get("search_interval", 10),
+            k=k,
+            ablate_retrieval=args.ablate_retrieval,
+        )
+        description_suffix = (
+            f", retrieval k={k}" + (" [ABLATED]" if args.ablate_retrieval else "")
+        )
+
     seed, row = seed_pose_from_database(database, args.seed_frame)
     controller = ModelController.from_checkpoint(
         args.model,
@@ -252,10 +320,12 @@ def build_controller(args, database, augmented, field, teacher_kwargs: dict):
         device=args.device,
         root_source=args.root_source,
         frame_time=database.frame_time,
+        **extra,
     )
-    # The model has no obstacle input in Phase 1, so a field placed in the
-    # scene is drawn but not reacted to. Saying so is better than letting
-    # someone conclude the model ignores geometry it was never shown.
+    # Obstacles are never part of either model's input, retrieval or not --
+    # a field placed in the scene is drawn but not reacted to. Saying so is
+    # better than letting someone conclude the model ignores geometry it was
+    # never shown.
     if field is not None and len(field):
         print(
             f"note: {len(field)} obstacles are in the scene, but this model "
@@ -265,5 +335,5 @@ def build_controller(args, database, augmented, field, teacher_kwargs: dict):
         controller,
         database,
         f"model {os.path.basename(args.model)} (seed row {row}, "
-        f"root_source={args.root_source})",
+        f"root_source={args.root_source}{description_suffix})",
     )

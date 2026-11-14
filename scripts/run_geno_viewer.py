@@ -98,11 +98,14 @@ def main(argv=None) -> int:
             "ground. Run scripts/recover_obstacles.py to produce it."
         )
 
-    # A model retrieves nothing, so the Matching Database it would search is
-    # never read. Building it anyway cost 23 seconds of startup against 3 for
-    # the one clip the seed pose comes from, so the model takes the short
-    # path. Measured, not assumed.
-    if args.model:
+    # A Phase 1 model retrieves nothing, so the Matching Database it would
+    # search is never read. Building it anyway cost 23 seconds of startup
+    # against 3 for the one clip the seed pose comes from, so that model
+    # takes the short path. A Phase 2 model needs the real thing to search,
+    # same as the teacher -- checked from the checkpoint's own manifest,
+    # before anything else loads.
+    needs_retrieval = session_wiring.model_needs_retrieval(args.model, args.model_manifest)
+    if args.model and not needs_retrieval:
         database, studio = session_wiring.load_model_scene(
             args.bvh_dir, args.clips, args.max_frames, layout
         )
