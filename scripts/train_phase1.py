@@ -124,8 +124,10 @@ def parse_args(argv=None):
     model.add_argument("--d-state", type=int, default=16, help="mamba only")
     model.add_argument("--n-heads", type=int, default=4, help="gpt only")
     model.add_argument(
-        "--window", type=int, default=64,
-        help="gpt only: the KV cache's bounded context, in frames",
+        "--gpt-window", type=int, default=64,
+        help="gpt only: the KV cache's bounded context, in frames. Distinct "
+        "from --window above, which is the training window length and "
+        "applies to every backbone.",
     )
     model.add_argument("--head", default="full", choices=["full", "residual"])
     model.add_argument("--no-contacts", action="store_true")
@@ -237,7 +239,7 @@ def build_policy(args, database: MotionDatabase) -> MmmPolicy:
         backbone = GptBackbone(
             GptConfig(
                 d_model=args.d_model, n_layers=args.n_layers,
-                n_heads=args.n_heads, window=args.window,
+                n_heads=args.n_heads, window=args.gpt_window,
             )
         )
     else:
