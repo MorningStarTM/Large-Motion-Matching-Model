@@ -1,0 +1,24 @@
+# ~10M parameter GPT backbone (Phase 1 pretrain).
+#
+# Approximate: a transformer block costs roughly 12 * d_model^2 parameters
+# at mlp_ratio=4 (qkv + proj + the two feed-forward linears), plus the
+# policy's own input layer and head. The exact count prints at the start of
+# every run (`policy: N parameters`) -- retune d_model/n_layers from that
+# number, do not trust this comment.
+#
+# --dataset is environment specific and deliberately left out here; pass it
+# on the command line:
+#   python scripts/gpt_trainer.py --config configs/gpt/config_10m.yaml --dataset data/bvh
+
+d_model: 384
+n_layers: 6
+n_heads: 6
+gpt_window: 64
+head: full
+
+batch_size: 16
+epochs: 50
+learning_rate: 0.001
+warmup_epochs: 1.0
+
+run_name: phase1_gpt_10m
