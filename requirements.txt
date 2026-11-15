@@ -32,3 +32,6 @@ huggingface_hub>=0.23
 
 # --- development --------------------------------------------------------
 pytest>=7.4            # tests/test_fk.py, tests/test_features.py
+
+# --- config-driven training (scripts/gpt_trainer.py) --------------------
+PyYAML>=6.0
