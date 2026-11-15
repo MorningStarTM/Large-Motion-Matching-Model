@@ -1,25 +1,14 @@
 """
 `PreTrainer`: the Phase 1 trainer. Learns how bodies move.
 
-Task (plan section 5.2): next pose prediction over long sequences. The joystick
-signal is taken from the data's own real future root path, and the retrieved
-candidates are included as input from the start, so the model learns to use
-retrieval rather than learning to work without it and having it bolted on later.
-
-Three mechanisms force that, and all three are on by default:
-
-1. **Leave one clip out** -- a frame's candidates never come from its own clip,
-   applied in `WindowDataset` where the retrieval happens.
-2. **Retrieval dropout** -- whole sequences occasionally arrive with the
-   candidates blanked, applied in `MmmPolicy.build_input`.
-3. **Held out styles** -- whole 100STYLE styles excluded from training, applied
-   in the split.
-
-Without them the model can memorise and ignore retrieval, which plan section 11
-names as a risk and which would quietly invalidate the main claim. So the
-validation pass here also evaluates *with the candidates zeroed* and reports the
-gap: `retrieval_gain` is how much worse the model does without retrieval, and it
-is tracked every epoch rather than discovered at the end.
+Task (plan section 5.2): next pose prediction over long sequences, from the
+joystick (taken from the data's own real future root path) and the model's
+own previous pose. There is no retrieval in this input -- a mechanism that
+concatenated raw candidate poses onto it, and the retrieval-dropout/ablation
+machinery built around that, used to live here and has been removed.
+Retrieval is coming back as an encoder feeding the backbone through
+cross-attention instead, which is a different mechanism than this trainer
+needs to know about.
 
 Drift is handled by scheduled sampling: teacher forcing first, then feeding the
 model's own predictions, on a schedule that ramps over training.
@@ -36,7 +25,6 @@ from dataclasses import dataclass, field
 import torch
 
 from mmm.data.database import MotionDatabase
-from mmm.models.heads import ResidualHead
 from mmm.models.policy import MmmPolicy
 from mmm.training.callbacks import (
     Callback,
@@ -93,9 +81,9 @@ class PreTrainerConfig:
     log_every: int = 1
     # Batches used for the free running rollout evaluation. That evaluation
     # steps frame by frame and so costs far more than the teacher forced pass,
-    # but it is the only regime in which retrieval can show its value at all
-    # (see `validate`), so it is measured on a fixed subset every epoch rather
-    # than skipped. 0 disables it.
+    # but it is the regime the model is actually deployed in, so it is
+    # measured on a fixed subset every epoch rather than skipped. 0 disables
+    # it.
     rollout_eval_batches: int = 8
     loss_weights: LossWeights = field(default_factory=LossWeights)
     calibrate_weights: bool = True
@@ -223,10 +211,10 @@ class PreTrainer:
         self.checkpoint_dir = checkpoint_dir
         # Recorded in the checkpoint and the manifest. The training loop below
         # is phase-agnostic next-pose prediction either way -- Phase 2 reuses
-        # this class wholesale, pointed at a policy built with
-        # `use_retrieval=True` and a dataset built from teacher rollouts
-        # instead of raw mocap -- so the one thing that has to be told apart
-        # is which phase produced the checkpoint, for anyone reading it later.
+        # this class wholesale, pointed at a dataset built from teacher
+        # rollouts instead of raw mocap -- so the one thing that has to be
+        # told apart is which phase produced the checkpoint, for anyone
+        # reading it later.
         self.phase = phase
 
         # A single process context behaves as a no-op throughout, so the single
@@ -323,32 +311,16 @@ class PreTrainer:
         """
         joystick = batch["joystick"]
         previous = batch["previous_pose"]
-        # Absent in Phase 1: the dataset does not build a candidate block when
-        # retrieval is off, so the trainer must not require one.
-        candidates = batch.get("candidates")
-        mask = batch.get("mask")
 
         if sampling_probability <= 0.0:
-            pose, contacts, _ = self.policy(
-                joystick,
-                previous,
-                candidates,
-                mask,
-                apply_retrieval_dropout=training,
-            )
+            pose, contacts, _ = self.policy(joystick, previous)
         else:
             batch_size, seq_len = joystick.shape[0], joystick.shape[1]
             state = self.module.initial_state(batch_size, device=joystick.device)
             fed = previous[:, 0]
             poses, contact_list = [], []
             for t in range(seq_len):
-                pose_t, contacts_t, state = self.module.step(
-                    joystick[:, t],
-                    fed,
-                    None if candidates is None else candidates[:, t],
-                    None if mask is None else mask[:, t],
-                    state,
-                )
+                pose_t, contacts_t, state = self.module.step(joystick[:, t], fed, state)
                 poses.append(pose_t)
                 if contacts_t is not None:
                     contact_list.append(contacts_t)
@@ -365,11 +337,7 @@ class PreTrainer:
             pose = torch.stack(poses, dim=1)
             contacts = torch.stack(contact_list, dim=1) if contact_list else None
 
-        correction = None
-        if isinstance(self.module.head, ResidualHead) and candidates is not None:
-            correction = ResidualHead.correction(pose, candidates, mask)
-
-        return pose, contacts, correction
+        return pose, contacts, None
 
     def _batch_to_device(self, batch: dict) -> dict:
         return {
@@ -464,20 +432,9 @@ class PreTrainer:
 
     @torch.no_grad()
     def validate(self, loader) -> dict:
-        """Validation, plus the retrieval ablation.
-
-        Reports two retrieval gains, and only the second one means anything:
-
-        - `retrieval_gain`, teacher forced. Near zero by construction, because
-          the true previous pose is supplied every frame and is a far better
-          predictor than any retrieved candidate.
-        - `rollout_retrieval_gain`, free running. The model is fed its own
-          output and must rely on retrieval to stay anchored. See
-          `_rollout_retrieval_gain`.
-        """
+        """Teacher forced validation, plus a free running rollout check."""
         self.policy.eval()
         totals: dict[str, float] = {}
-        ablated_total = 0.0
         n_batches = 0
 
         for batch in loader:
@@ -493,60 +450,27 @@ class PreTrainer:
             )
             for name, value in terms.items():
                 totals[name] = totals.get(name, 0.0) + value
-
-            if "candidates" in batch:
-                blanked = dict(batch)
-                blanked["candidates"] = torch.zeros_like(batch["candidates"])
-                blanked["mask"] = torch.zeros_like(batch["mask"])
-            else:
-                # Phase 1 has no retrieval to ablate, so the "without" pass is
-                # the same pass. The gain is then exactly zero by definition
-                # rather than by measurement, which is the honest answer.
-                blanked = batch
-            ablated_pose, ablated_contacts, _ = self._rollout(blanked, 0.0, training=False)
-            _, ablated_terms = self.loss_fn(
-                ablated_pose,
-                batch["target"],
-                predicted_contacts=ablated_contacts,
-                target_contacts=batch.get("contacts"),
-            )
-            ablated_total += ablated_terms["total"]
             n_batches += 1
 
         result = {name: value / max(n_batches, 1) for name, value in totals.items()}
-        result["total_without_retrieval"] = ablated_total / max(n_batches, 1)
-        result["retrieval_gain"] = result["total_without_retrieval"] - result["total"]
-        result.update(self._rollout_retrieval_gain(loader))
+        result.update(self._rollout_eval(loader))
         return result
 
-    def _rollout_retrieval_gain(self, loader) -> dict:
-        """Retrieval gain under *free running* rollout, not teacher forcing.
+    def _rollout_eval(self, loader) -> dict:
+        """Loss under *free running* rollout, not teacher forcing.
 
-        This is the number the editability claim actually rests on, and the
-        teacher forced one above cannot show it.
-
-        Under teacher forcing the model is handed the true previous pose every
-        frame, and at 60Hz that pose is an excellent predictor of the next one:
-        measured on this database, simply copying it scores 2.29 while copying
-        the nearest retrieved candidate scores 16.24, seven times worse,
-        because leave one clip out forces the match to come from a different
-        subject at a different point in its stride. So a model under teacher
-        forcing is *right* to ignore the candidates, and a retrieval gain near
-        zero there says nothing about whether retrieval is useful.
-
-        Free running is the regime the model is actually deployed in. Its own
-        output is fed back, error accumulates, and the retrieved candidates are
-        the only thing in its input still anchored to real motion. If retrieval
-        does not help here, it does not help anywhere, and the Phase 1 claim
-        has failed in a way no amount of validation loss would reveal.
+        Teacher forcing hands the model the true previous pose every frame,
+        which at 60Hz is an excellent predictor on its own. Free running is
+        the regime the model is actually deployed in: its own output is fed
+        back and error accumulates, so this is the number that actually
+        reflects how the model holds up over a real session.
         """
         limit = self.config.rollout_eval_batches
         if not limit:
             return {}
 
         self.policy.eval()
-        with_retrieval = 0.0
-        without = 0.0
+        total = 0.0
         n = 0
         for batch in loader:
             if n >= limit:
@@ -561,31 +485,12 @@ class PreTrainer:
                 target_contacts=batch.get("contacts"),
                 correction=correction,
             )
-            with_retrieval += terms["total"]
-
-            if "candidates" in batch:
-                blanked = dict(batch)
-                blanked["candidates"] = torch.zeros_like(batch["candidates"])
-                blanked["mask"] = torch.zeros_like(batch["mask"])
-            else:
-                blanked = batch
-            ablated_pose, ablated_contacts, _ = self._rollout(blanked, 1.0, training=False)
-            _, ablated_terms = self.loss_fn(
-                ablated_pose,
-                batch["target"],
-                predicted_contacts=ablated_contacts,
-                target_contacts=batch.get("contacts"),
-            )
-            without += ablated_terms["total"]
+            total += terms["total"]
             n += 1
 
         if not n:
             return {}
-        return {
-            "rollout_total": with_retrieval / n,
-            "rollout_total_without_retrieval": without / n,
-            "rollout_retrieval_gain": (without - with_retrieval) / n,
-        }
+        return {"rollout_total": total / n}
 
     def _calibrate(self, batch: dict) -> None:
         """Set the loss weights so each term has roughly equal magnitude.
@@ -823,17 +728,9 @@ class PreTrainer:
             f"| ss {train_metrics['sampling_probability']:.2f}"
         )
         if val_metrics is not None:
-            line += (
-                f" | val {val_metrics['total']:.5f}"
-                f" | gain tf {val_metrics['retrieval_gain']:+.4f}"
-            )
-            # The free running gain is the one that means anything; it is
-            # printed second so the two are never confused in a log.
-            if "rollout_retrieval_gain" in val_metrics:
-                line += (
-                    f" | rollout {val_metrics['rollout_total']:.3f}"
-                    f" gain {val_metrics['rollout_retrieval_gain']:+.4f}"
-                )
+            line += f" | val {val_metrics['total']:.5f}"
+            if "rollout_total" in val_metrics:
+                line += f" | rollout {val_metrics['rollout_total']:.3f}"
         line += f" | {seconds:.1f}s"
         print(line)
 
@@ -864,9 +761,8 @@ class PreTrainer:
                 "architecture": self.module.describe(),
                 "loss_weights": self.loss_fn.weights.as_dict(),
                 "config": self.config.as_dict(),
-                # Pins the checkpoint to the data it was trained on. A policy
-                # is only meaningful alongside the database it retrieves from,
-                # because the candidate poses are part of its input.
+                # Pins the checkpoint to the data it was trained on, for
+                # provenance.
                 "database": {
                     "fingerprint": database_fingerprint(self.database),
                     "n_rows": self.database.n_rows,
@@ -881,14 +777,14 @@ class PreTrainer:
         """Load a checkpoint, refusing an incompatible architecture.
 
         The three phases run as separate processes days apart, so a checkpoint
-        whose pose width or candidate count no longer matches must fail here
-        rather than load with silently reshaped weights.
+        whose pose width no longer matches must fail here rather than load
+        with silently reshaped weights.
         """
         blob = load_checkpoint(path, device=self.device)
         if strict and "architecture" in blob:
             saved = blob["architecture"]
             current = self.module.describe()
-            for key in ("pose_dim", "input_dim", "output_dim", "n_candidates", "d_model", "head"):
+            for key in ("pose_dim", "input_dim", "output_dim", "d_model", "head"):
                 if saved.get(key) != current.get(key):
                     raise ValueError(
                         f"checkpoint {path} has {key}={saved.get(key)!r} but this "

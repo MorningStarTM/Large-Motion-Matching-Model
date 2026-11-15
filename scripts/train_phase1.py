@@ -2,13 +2,10 @@
 Phase 1 entry point: pretrain the motion prior on raw mocap.
 
 Learns how bodies move -- next pose prediction from the joystick request and
-the model's own previous pose. Retrieval is **not** in the input: measured on
-LaFAN1, the true previous pose scores 2.29 against 16.24 for the nearest
-retrieved candidate, so under teacher forcing the candidate block carries no
-signal the objective rewards, and training with it risks teaching the model
-that its knowledge base is noise. Retrieval enters in Phase 2, where the target
-is the KNN teacher's own output. `--use-retrieval` restores it for that
-ablation.
+the model's own previous pose. There is no retrieval in this input: a
+mechanism that concatenated raw candidate poses onto it used to live here,
+for both Phase 1 and Phase 2; it has been removed. Retrieval is coming back
+as an encoder feeding the backbone through cross-attention instead.
 
 Runs unchanged on a workstation, in a Kaggle notebook and in Colab: paths are
 resolved by `mmm.workspace` rather than assumed, because Kaggle mounts the
@@ -49,8 +46,9 @@ from mmm.data.database import MotionDatabase
 from mmm.data.dataset import WindowDataset, collate
 from mmm.data.prepare import LOCOMOTION_PATTERN, ensure_database
 from mmm.models.baselines.gru import GruBackbone
+from mmm.models.gpt.backbone import GptBackbone, GptConfig
 from mmm.models.io_layers import IoSpec
-from mmm.models.mamba_backbone import MambaBackbone, MambaConfig
+from mmm.models.mamba.backbone import MambaBackbone, MambaConfig
 from mmm.models.policy import MmmPolicy
 from mmm.training.losses import LossWeights
 from mmm.training.distributed import DistributedContext
@@ -120,25 +118,19 @@ def parse_args(argv=None):
     windows.add_argument("--workers", type=int, default=0)
 
     model = parser.add_argument_group("model")
-    model.add_argument("--backbone", default="mamba", choices=["mamba", "gru"])
+    model.add_argument("--backbone", default="mamba", choices=["mamba", "gru", "gpt"])
     model.add_argument("--d-model", type=int, default=256)
     model.add_argument("--n-layers", type=int, default=4)
-    model.add_argument("--d-state", type=int, default=16)
+    model.add_argument("--d-state", type=int, default=16, help="mamba only")
+    model.add_argument("--n-heads", type=int, default=4, help="gpt only")
+    model.add_argument(
+        "--window", type=int, default=64,
+        help="gpt only: the KV cache's bounded context, in frames",
+    )
     model.add_argument("--head", default="full", choices=["full", "residual"])
     model.add_argument("--no-contacts", action="store_true")
     model.add_argument("--input-dropout", type=float, default=0.0)
     model.add_argument("--hidden-dropout", type=float, default=0.0)
-
-    retrieval = parser.add_argument_group("retrieval (Phase 2 ablation)")
-    retrieval.add_argument(
-        "--use-retrieval",
-        action="store_true",
-        help="put the retrieved candidates in the input, widening it from 163 "
-        "to 771. Off by default; see this script's docstring.",
-    )
-    retrieval.add_argument("--k", type=int, default=4)
-    retrieval.add_argument("--retrieval-dropout", type=float, default=0.1)
-    retrieval.add_argument("--no-leave-one-clip-out", action="store_true")
 
     optimisation = parser.add_argument_group("optimisation")
     optimisation.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=50)
@@ -235,13 +227,18 @@ def parse_args(argv=None):
 def build_policy(args, database: MotionDatabase) -> MmmPolicy:
     spec = IoSpec(
         pose_dim=database.pose_dim,
-        n_candidates=args.k,
-        use_retrieval=args.use_retrieval,
         predict_contacts=not args.no_contacts,
     )
     if args.backbone == "mamba":
         backbone = MambaBackbone(
             MambaConfig(d_model=args.d_model, n_layers=args.n_layers, d_state=args.d_state)
+        )
+    elif args.backbone == "gpt":
+        backbone = GptBackbone(
+            GptConfig(
+                d_model=args.d_model, n_layers=args.n_layers,
+                n_heads=args.n_heads, window=args.window,
+            )
         )
     else:
         backbone = GruBackbone(d_model=args.d_model, n_layers=args.n_layers)
@@ -251,7 +248,6 @@ def build_policy(args, database: MotionDatabase) -> MmmPolicy:
         backbone=backbone,
         head=args.head,
         d_model=args.d_model,
-        retrieval_dropout=args.retrieval_dropout,
         input_dropout=args.input_dropout,
         hidden_dropout=args.hidden_dropout,
     )
@@ -307,10 +303,8 @@ def main(argv=None) -> int:
         database,
         window=args.window,
         stride=args.stride,
-        k=args.k,
-        leave_one_clip_out=not args.no_leave_one_clip_out,
         seed=args.seed,
-        use_retrieval=args.use_retrieval,
+        use_retrieval=False,
         elevated_contacts=args.elevated_contacts,
         # Never beside the database: on Kaggle that can be a read only mount.
         cache_dir=workspace.cache,

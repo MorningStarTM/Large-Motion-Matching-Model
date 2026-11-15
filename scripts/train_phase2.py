@@ -1,9 +1,10 @@
 """
 Phase 2 entry point: SFT on round 1 teacher rollouts.
 
-Starts from a finished Phase 1 checkpoint, widens its input layer for
-retrieval (`mmm.training.phase2_distill.build_sft_policy`), builds training
-windows out of the logs `scripts/collect_teacher_data.py` produced
+Starts from a finished Phase 1 checkpoint as-is -- same input, joystick plus
+the model's own previous pose, no retrieved candidates
+(`mmm.training.phase2_distill.build_sft_policy`) -- builds training windows
+out of the logs `scripts/collect_teacher_data.py` produced
 (`mmm.data.rollout_dataset.RolloutWindowDataset`), and trains with
 `mmm.training.pretrainer.PreTrainer` -- the same trainer Phase 1 uses; see
 `mmm/training/phase2_distill.py`'s docstring for why that is correct rather
@@ -90,8 +91,6 @@ def parse_args(argv=None):
         "really do match this run's (collection's collection_summary.json "
         "has them); this flag does not check that for you.",
     )
-    rollouts.add_argument("--k", type=int, default=4, help="used only if no rollout ever searched")
-
     paths = parser.add_argument_group("paths")
     paths.add_argument("--out", default="")
     paths.add_argument("--work-dir", default="")
@@ -212,21 +211,13 @@ def main(argv=None) -> int:
         elevated_contacts=args.elevated_contacts,
         check_fingerprint=not args.allow_fingerprint_mismatch,
     )
-    n_candidates = dataset.n_candidates or args.k
-    if dataset.n_candidates and dataset.n_candidates != args.k:
-        say(
-            f"note: the logged rollouts used k={dataset.n_candidates}; "
-            f"building the policy for that, not --k={args.k}"
-        )
     train_set, val_set = dataset.split(validation_fraction=args.validation_fraction, seed=args.seed)
     say(
         f"{len(train_set)} training windows, {len(val_set)} validation windows, "
-        f"from {len(dataset.source_paths)} rollout file(s), k={n_candidates}"
+        f"from {len(dataset.source_paths)} rollout file(s)"
     )
 
-    policy, phase1_architecture = build_sft_policy(
-        args.phase1_checkpoint, n_candidates=n_candidates, device="cpu"
-    )
+    policy, phase1_architecture = build_sft_policy(args.phase1_checkpoint, device="cpu")
     say(f"policy: {policy.n_parameters():,} parameters (extended from {args.phase1_checkpoint})")
     for key, value in policy.describe().items():
         say(f"  {key:18} {value}")
@@ -287,7 +278,6 @@ def main(argv=None) -> int:
                     "world_size": distributed.world_size,
                     "effective_batch": effective_batch,
                     "learning_rate": learning_rate,
-                    "n_candidates": n_candidates,
                     "phase1_architecture": phase1_architecture,
                 },
                 handle,

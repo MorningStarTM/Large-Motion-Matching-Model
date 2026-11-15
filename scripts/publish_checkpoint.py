@@ -51,17 +51,11 @@ tags:
 
 # {title}
 
-Retrieval augmented state space model for real time character animation: a
-Mamba backbone that takes a joystick request, its own previous pose, and `k`
-poses retrieved from a motion matching database, and predicts the next pose.
+State space model for real time character animation: a Mamba backbone that
+takes a joystick request and its own previous pose, and predicts the next
+pose. There is no retrieval in the input.
 
 This is a **Phase {phase}** checkpoint ({phase_name}).
-
-## This model is not usable on its own
-
-The retrieved candidate poses are part of the input, not an optional extra.
-Without the matching database the model is being fed zeros in {candidate_share}
-of its input width and will not produce correct motion.
 
 The database this checkpoint was trained against:
 
@@ -86,21 +80,6 @@ retrieved poses are in a different space from the ones the model learned on.
 ## Training
 
 {metrics_section}
-
-## Retrieval gain
-
-The number this project is actually judged on. It is the validation loss with
-the retrieved candidates zeroed, minus the loss with them present, so positive
-means retrieval is helping.
-
-It is reported in two regimes and **only the free running one is meaningful**.
-Under teacher forcing the model is handed the true previous pose every frame,
-and at 60Hz that is a far better predictor than any retrieved candidate --
-measured on this database, copying the previous pose scores 2.29 while copying
-the nearest candidate scores 16.24. A teacher forced model is therefore right
-to ignore retrieval, and its gain sits at zero whatever the model has learned.
-
-{gain_section}
 
 ## Provenance
 
@@ -202,7 +181,6 @@ def _architecture_rows(architecture: dict) -> str:
         "head",
         "pose_dim",
         "joystick_dim",
-        "n_candidates",
         "input_dim",
         "output_dim",
         "predict_contacts",
@@ -221,8 +199,8 @@ def _architecture_rows(architecture: dict) -> str:
     return "\n".join(rows)
 
 
-def _metrics_section(history) -> tuple[str, str]:
-    """Returns `(training table, retrieval gain table)`.
+def _metrics_section(history) -> str:
+    """The training/validation curve table.
 
     `history.json` is columnar -- `{metric: [value per epoch]}` -- as
     `PreTrainer._record` builds it, not a list of per epoch rows.
@@ -230,8 +208,7 @@ def _metrics_section(history) -> tuple[str, str]:
     if not history or "train_total" not in history:
         return (
             "No usable `history.json` was found beside the checkpoint, so no "
-            "training curve is reported.",
-            "Not reported: no history file was available.",
+            "training curve is reported."
         )
 
     def column(name):
@@ -260,50 +237,14 @@ def _metrics_section(history) -> tuple[str, str]:
         lines.append(
             f"| {i + 1} ({label}) | {at(train, i):.4f} | {at(validation, i):.4f} |"
         )
-    training = "\n".join(lines) + f"\n\nTrained for {n_epochs} epochs."
-
-    gain_lines = [
-        "| regime | with retrieval | without | gain |",
-        "| --- | --- | --- | --- |",
-    ]
-    if validation and column("val_total_without_retrieval"):
-        gain_lines.append(
-            f"| teacher forced | {at(validation, best):.4f} "
-            f"| {at(column('val_total_without_retrieval'), best):.4f} "
-            f"| {at(column('val_retrieval_gain'), best):+.4f} |"
-        )
-    if column("val_rollout_total"):
-        gain_lines.append(
-            f"| **free running** | {at(column('val_rollout_total'), best):.4f} "
-            f"| {at(column('val_rollout_total_without_retrieval'), best):.4f} "
-            f"| **{at(column('val_rollout_retrieval_gain'), best):+.4f}** |"
-        )
-
-    if len(gain_lines) > 2:
-        gain = "\n".join(gain_lines)
-        if not column("val_rollout_total"):
-            gain += (
-                "\n\n**This checkpoint predates the free running evaluation**, so "
-                "only the uninformative teacher forced gain is available for it."
-            )
-    else:
-        gain = "Not reported: the history file carries no ablation columns."
-    return training, gain
+    return "\n".join(lines) + f"\n\nTrained for {n_epochs} epochs."
 
 
 def build_card(args, metadata: dict, history, filename: str) -> str:
     architecture = metadata.get("architecture", {}) or {}
     database = metadata.get("database", {}) or {}
     phase = metadata.get("phase", 1)
-    training, gain = _metrics_section(history)
-
-    pose_dim = architecture.get("pose_dim")
-    input_dim = architecture.get("input_dim")
-    candidates = architecture.get("n_candidates")
-    if pose_dim and input_dim and candidates:
-        share = f"{100 * candidates * pose_dim / input_dim:.0f}%"
-    else:
-        share = "most"
+    training = _metrics_section(history)
 
     clips = database.get("clips") or []
     return CARD_TEMPLATE.format(
@@ -311,7 +252,6 @@ def build_card(args, metadata: dict, history, filename: str) -> str:
         title=args.repo_id.split("/")[-1],
         phase=phase,
         phase_name=PHASE_NAMES.get(phase, "unknown phase"),
-        candidate_share=share,
         db_fingerprint=database.get("fingerprint", "unknown"),
         db_rows=f"{database.get('n_rows', 0):,}",
         db_pose_dim=database.get("pose_dim", "unknown"),
@@ -319,7 +259,6 @@ def build_card(args, metadata: dict, history, filename: str) -> str:
         db_clips=f"{len(clips)}" + (f" ({', '.join(clips[:4])}...)" if len(clips) > 4 else ""),
         architecture_rows=_architecture_rows(architecture),
         metrics_section=training,
-        gain_section=gain,
         filename=filename,
     )
 

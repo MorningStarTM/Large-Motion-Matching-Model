@@ -7,9 +7,7 @@ writes down every situation and move. This script flips who drives. The
 *student* -- the model being trained, loaded from a checkpoint -- plays an
 entire session on its own: its own joystick response, its own drift, fed back
 into itself exactly as it would be at runtime
-(`mmm.models.runtime.ModelController`, including searching the database on
-its own behalf now that it has retrieval in its input). Nobody corrects it
-while it runs.
+(`mmm.models.runtime.ModelController`). Nobody corrects it while it runs.
 
 At every single frame, though, a snapshot is taken of exactly where the
 student really is -- mistakes and all -- and handed to the teacher with one
@@ -179,26 +177,14 @@ def main(argv=None) -> int:
     rng = np.random.RandomState(args.seed)
     seed_pose, origin, forward = random_seed_pose(database, rng)
 
-    policy, architecture, _ = load_policy_from_manifest(
+    policy, _architecture, _ = load_policy_from_manifest(
         args.checkpoint, manifest=args.manifest or None, device=args.device
     )
-    if not architecture.get("use_retrieval"):
-        print(
-            "note: this checkpoint has no retrieval in its input -- it looks "
-            "like a Phase 1 checkpoint, not a Phase 2 one. DAgger relabels a "
-            "model that already searches the database; "
-            "scripts/collect_teacher_data.py is round 1, which is what a "
-            "Phase 1 checkpoint needs before this.",
-            file=sys.stderr,
-        )
-        return 1
 
     student = ModelController(
         policy, database.skeleton, seed_pose,
         frame_time=database.frame_time, device=args.device,
         root_source=args.root_source,
-        database=database, index=index,
-        search_interval=args.search_interval, k=args.k,
     )
     student.reset(origin=origin, forward=forward, seed_pose=seed_pose)
 

@@ -1,19 +1,9 @@
 """
-Free-running rollout evaluation for one checkpoint, with and without retrieval.
+Free-running rollout evaluation for one checkpoint.
 
-For a Phase 2 (retrieval) checkpoint, runs the exact same joystick session
-twice -- once with the model searching the database every `--search-interval`
-frames as it was trained to, once with the real search still running (so the
-numbers are comparable) but zeroed candidates handed to the policy instead.
-This is the same ablation `PreTrainer._validate` computes during training
-(`val_rollout_total_without_retrieval`), run here on an actual rollout rather
-than teacher-forced validation windows -- the question this answers is
-whether retrieval is pulling its weight in the regime that actually matters,
-free running, not just lowering a validation number.
-
-A Phase 1 checkpoint has nothing to ablate, so it runs once.
-
-Two kinds of number are reported, for every rollout:
+Drives the checkpoint through one joystick session (no retrieval -- the model
+reads only the joystick and its own previous pose) and reports two kinds of
+number:
 
 1. **Visible symptoms, not losses:** foot sliding (how fast a planted foot
    moves when it shouldn't), hips height (the "floating" failure this
@@ -28,9 +18,9 @@ Two kinds of number are reported, for every rollout:
    own `PoseLoss` (the identical rotation/position/velocity/root terms every
    training log already reports), using the checkpoint's own calibrated
    weights when its manifest has them. This is what makes different
-   checkpoints -- Phase 1, SFT, a DAgger round, with or without retrieval --
-   comparable on one scale: how far each one drifts from what classic motion
-   matching would have done, from the states each one actually visits.
+   checkpoints -- Phase 1, SFT, a DAgger round -- comparable on one scale:
+   how far each one drifts from what classic motion matching would have
+   done, from the states each one actually visits.
 
 Usage:
     python scripts/eval_checkpoints.py --dataset data/bvh/bvh --pattern "*" --trim-calibration --checkpoint runs/phase2_sft_v1/best.safetensors --frames 1800
@@ -82,8 +72,7 @@ def parse_args(argv=None):
     model.add_argument("--manifest", default="")
     model.add_argument("--device", default="cpu")
     model.add_argument("--root-source", default="hybrid", choices=["hybrid", "simulation", "animation"])
-    model.add_argument("--search-interval", type=int, default=10)
-    model.add_argument("--k", type=int, default=4)
+    model.add_argument("--k", type=int, default=4, help="teacher's search width, for the vs-teacher score")
     model.add_argument("--seed-frame", type=int, default=DEFAULT_SEED_FRAME)
 
     run = parser.add_argument_group("rollout")
@@ -133,7 +122,7 @@ def compute_metrics(poses: np.ndarray, skeleton, frame_time: float) -> dict:
     }
 
 
-def rollout(policy, database, index, teacher, pose_loss, seed_pose, args, ablate_retrieval: bool) -> dict:
+def rollout(policy, database, teacher, pose_loss, seed_pose, args) -> dict:
     """One free-running session, driven by a fresh, seeded joystick.
 
     At every frame, before the model advances, the teacher is asked what it
@@ -144,15 +133,10 @@ def rollout(policy, database, index, teacher, pose_loss, seed_pose, args, ablate
     joystick = SyntheticJoystick(
         frame_time=database.frame_time, config=JoystickConfig(), seed=args.seed
     )
-    use_retrieval = bool(getattr(policy.spec, "use_retrieval", False))
     controller = ModelController(
         policy, database.skeleton, seed_pose,
         frame_time=database.frame_time, device=args.device,
         root_source=args.root_source,
-        database=database if use_retrieval else None,
-        index=index if use_retrieval else None,
-        search_interval=args.search_interval, k=args.k,
-        ablate_retrieval=ablate_retrieval,
     )
 
     poses = np.empty((args.frames, database.animation.pose_dim), np.float32)
@@ -177,8 +161,6 @@ def rollout(policy, database, index, teacher, pose_loss, seed_pose, args, ablate
         )
 
     metrics = compute_metrics(poses, database.skeleton, database.frame_time)
-    metrics["ablate_retrieval"] = ablate_retrieval
-    metrics["used_retrieval_input"] = use_retrieval and not ablate_retrieval
 
     total, terms = pose_loss(
         torch.from_numpy(poses)[None], torch.from_numpy(teacher_labels)[None]
@@ -216,12 +198,12 @@ def main(argv=None) -> int:
     database = MotionDatabase.load(database_path)
     print(database)
 
-    policy, architecture, _ = load_policy_from_manifest(
+    policy, _architecture, _ = load_policy_from_manifest(
         args.checkpoint, manifest=args.manifest or None, device=args.device
     )
-    # Always built, not only for a retrieval checkpoint: this index backs the
-    # teacher used to score EVERY checkpoint against classic motion matching,
-    # independent of whether the checkpoint itself retrieves anything.
+    # This index backs the teacher used to score the checkpoint against
+    # classic motion matching -- separate from the model's own input, which
+    # has no retrieval in it.
     index = KnnIndex(database)
     teacher = KnnController(database, index=index, k=args.k)
 
@@ -234,23 +216,8 @@ def main(argv=None) -> int:
     seed_pose, row = seed_pose_from_database(database, args.seed_frame)
 
     print(f"\n{os.path.basename(args.checkpoint)} (seed row {row}, {args.frames} frames):")
-    with_retrieval = rollout(
-        policy, database, index, teacher, pose_loss, seed_pose, args, ablate_retrieval=False
-    )
-    _print_row("with retrieval", with_retrieval)
-
-    without_retrieval = None
-    if architecture.get("use_retrieval"):
-        without_retrieval = rollout(
-            policy, database, index, teacher, pose_loss, seed_pose, args, ablate_retrieval=True
-        )
-        _print_row("without retrieval", without_retrieval)
-        gain = without_retrieval["foot_sliding_cm_s"] - with_retrieval["foot_sliding_cm_s"]
-        teacher_gain = without_retrieval["vs_teacher"]["total"] - with_retrieval["vs_teacher"]["total"]
-        print(f"  retrieval reduces sliding by {gain:+.1f} cm/s (positive = retrieval helps)")
-        print(f"  retrieval reduces vs-teacher loss by {teacher_gain:+.4f} (positive = retrieval helps)")
-    else:
-        print("  (Phase 1 checkpoint -- nothing to ablate)")
+    metrics = rollout(policy, database, teacher, pose_loss, seed_pose, args)
+    _print_row(os.path.basename(args.checkpoint), metrics)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
@@ -258,8 +225,7 @@ def main(argv=None) -> int:
                 {
                     "checkpoint": args.checkpoint,
                     "seed_row": row,
-                    "with_retrieval": with_retrieval,
-                    "without_retrieval": without_retrieval,
+                    "metrics": metrics,
                 },
                 handle,
                 indent=2,
