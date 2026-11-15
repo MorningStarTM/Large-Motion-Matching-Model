@@ -218,7 +218,7 @@ def main(argv=None) -> int:
     )
 
     policy, phase1_architecture = build_sft_policy(args.phase1_checkpoint, device="cpu")
-    say(f"policy: {policy.n_parameters():,} parameters (extended from {args.phase1_checkpoint})")
+    say(f"policy: {policy.n_parameters():,} parameters (loaded from {args.phase1_checkpoint})")
     for key, value in policy.describe().items():
         say(f"  {key:18} {value}")
 
