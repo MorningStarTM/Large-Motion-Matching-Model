@@ -300,7 +300,15 @@ def main(argv=None) -> int:
     card = build_card(args, metadata, history, filename)
 
     uploads = [(args.checkpoint, filename), (None, "README.md")]
-    for extra in ("manifest.json", "history.json"):
+    for extra in (
+        "last.safetensors",
+        "metrics.csv",
+        "history.json",
+        "manifest.json",
+        "run_args.json",
+    ):
+        if extra == filename:
+            continue  # already queued as the checkpoint itself
         candidate = os.path.join(os.path.dirname(args.checkpoint), extra)
         if os.path.exists(candidate):
             uploads.append((candidate, extra))
