@@ -31,6 +31,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import threading
 import time
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "ProgressLogger",
     "EarlyStopping",
     "LearningRateLogger",
+    "StallWatchdog",
 ]
 
 
@@ -371,6 +373,60 @@ class EarlyStopping(Callback):
                 f"{self.patience} epochs; best {self.best:.6f} at epoch "
                 f"{self.best_epoch}"
             )
+
+
+class StallWatchdog:
+    """Kills this process if no training progress is seen for `timeout`
+    seconds.
+
+    Not a `Callback`: `CallbackList` only runs on rank 0 (see `PreTrainer.fit`
+    -- the other ranks are built with an empty callback list, since only rank
+    0 logs and checkpoints), but every rank needs its own watchdog. A rank
+    stuck waiting at the next collective while rank 0 hangs is itself idle,
+    billed GPU time that nothing else is watching.
+
+    A normal callback could not do this job anyway: the hang happens *inside*
+    a blocking call (a stuck disk write, a wedged NCCL collective), so nothing
+    ever reaches `on_epoch_end` to react to it. This runs a background thread
+    that checks wall clock time independently of where the main thread
+    actually is, and kills the whole process with `os._exit` -- not
+    `sys.exit`, which only raises an exception a thread stuck in a C call
+    would never see -- the moment `beat()` has gone silent too long.
+
+    Built for unattended runs (Kaggle, Colab): a hung process otherwise sits
+    there, GPU allocated and billed, until the session's own time limit, with
+    nobody watching.
+    """
+
+    def __init__(self, timeout: float, check_every: float = 30.0):
+        self.timeout = timeout
+        self.check_every = check_every
+        self._last_beat = time.time()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def beat(self) -> None:
+        self._last_beat = time.time()
+
+    def start(self) -> None:
+        self.beat()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self.check_every):
+            idle = time.time() - self._last_beat
+            if idle > self.timeout:
+                print(
+                    f"[StallWatchdog] no training progress for {idle:.0f}s "
+                    f"(timeout {self.timeout:.0f}s) -- killing this process "
+                    "now rather than let it burn GPU time unwatched.",
+                    flush=True,
+                )
+                os._exit(1)
 
 
 class LearningRateLogger(Callback):

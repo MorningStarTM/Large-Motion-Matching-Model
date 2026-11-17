@@ -204,6 +204,15 @@ def parse_args(argv=None):
         "last.safetensors in --out if it is there. 'auto' is what a Kaggle "
         "session that hit its time limit needs.",
     )
+    runtime.add_argument(
+        "--stall-timeout-minutes",
+        type=float,
+        default=20.0,
+        help="kill this process if no training progress is seen for this "
+        "long -- a stuck disk write or a wedged NCCL collective otherwise "
+        "burns billed GPU time with nobody watching until the session's own "
+        "limit. 0 disables it.",
+    )
 
     publish = parser.add_argument_group("publishing")
     publish.add_argument(
@@ -369,6 +378,7 @@ def main(argv=None) -> int:
         progress_every=args.progress_every,
         compile_policy=args.compile_policy,
         loss_weights=LossWeights(residual=args.residual_weight),
+        stall_timeout_minutes=args.stall_timeout_minutes,
     )
     trainer = PreTrainer(
         policy,

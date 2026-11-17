@@ -147,6 +147,15 @@ def parse_args(argv=None):
     runtime.add_argument("--no-tensorboard", action="store_true")
     runtime.add_argument("--progress-every", type=int, default=25)
     runtime.add_argument("--resume", default="")
+    runtime.add_argument(
+        "--stall-timeout-minutes",
+        type=float,
+        default=20.0,
+        help="kill this process if no training progress is seen for this "
+        "long -- a stuck disk write or a wedged NCCL collective otherwise "
+        "burns billed GPU time with nobody watching until the session's own "
+        "limit. 0 disables it.",
+    )
 
     publish = parser.add_argument_group("publishing")
     publish.add_argument("--hf-repo", "--push-to-hub", dest="hf_repo", default="", metavar="REPO_ID")
@@ -255,6 +264,7 @@ def main(argv=None) -> int:
         progress_every=args.progress_every,
         compile_policy=args.compile_policy,
         loss_weights=LossWeights(),
+        stall_timeout_minutes=args.stall_timeout_minutes,
     )
     trainer = PreTrainer(
         policy, database, config, checkpoint_dir=workspace.out, distributed=distributed, phase=2

@@ -33,6 +33,7 @@ from mmm.training.callbacks import (
     EarlyStopping,
     LearningRateLogger,
     ProgressLogger,
+    StallWatchdog,
     TensorBoard,
 )
 from mmm.training.checkpoints import load_checkpoint, save_checkpoint
@@ -133,6 +134,18 @@ class PreTrainerConfig:
     # than fatal.
     compile_policy: bool = False
 
+    # Kills this process if no training progress (a batch or an epoch
+    # boundary) is seen for this many minutes. 0 disables it. Exists for
+    # unattended runs where a hung process -- a stuck disk write, a wedged
+    # NCCL collective -- otherwise burns billed GPU time with nobody
+    # watching until the session's own limit. See
+    # `mmm.training.callbacks.StallWatchdog` for why a plain callback cannot
+    # do this job. 20 minutes comfortably exceeds every observed per-epoch
+    # time on Kaggle so far (tens of seconds for a small GPT backbone, up to
+    # ~530s for a 10M parameter Mamba backbone with rollout eval), so it
+    # should only ever fire on a genuine stall, not a slow but healthy epoch.
+    stall_timeout_minutes: float = 20.0
+
     @property
     def resolved_monitor_start(self) -> int:
         if self.monitor_start_epoch is not None:
@@ -180,6 +193,7 @@ class PreTrainerConfig:
                 "monitor_start_epoch",
                 "compile_policy",
                 "rollout_eval_batches",
+                "stall_timeout_minutes",
             )
         }
         out["loss_weights"] = self.loss_weights.as_dict()
@@ -216,6 +230,7 @@ class PreTrainer:
         # told apart is which phase produced the checkpoint, for anyone
         # reading it later.
         self.phase = phase
+        self._watchdog = None  # set up in fit(); None outside it is a no-op
 
         # A single process context behaves as a no-op throughout, so the single
         # GPU path is the same code path rather than a second one.
@@ -399,6 +414,13 @@ class PreTrainer:
             self.optimizer.step()
             self.global_step += 1
 
+            # Every rank, unlike the logging callbacks below: a rank with no
+            # validation or checkpointing to do still needs its own proof of
+            # life, since it is the one left waiting (and billing GPU time)
+            # if the stall is on another rank.
+            if self._watchdog is not None:
+                self._watchdog.beat()
+
             for name, value in terms.items():
                 totals[name] = totals.get(name, 0.0) + value
             n_batches += 1
@@ -581,6 +603,17 @@ class PreTrainer:
             {"config": config.as_dict(), "architecture": self.module.describe()}
         )
 
+        # Every rank, not just rank 0: `self.callbacks` above is empty on the
+        # others, but a rank stuck waiting at the next collective is itself
+        # idle GPU time nobody is watching either.
+        self._watchdog = (
+            StallWatchdog(timeout=config.stall_timeout_minutes * 60)
+            if config.stall_timeout_minutes > 0
+            else None
+        )
+        if self._watchdog is not None:
+            self._watchdog.start()
+
         best_metric = math.inf
         best_epoch = 0
         monitor_key = None
@@ -589,6 +622,8 @@ class PreTrainer:
         try:
             for epoch in range(self.start_epoch, config.epochs + 1):
                 started = time.time()
+                if self._watchdog is not None:
+                    self._watchdog.beat()
                 self.callbacks.on_epoch_begin(epoch)
 
                 # A DistributedSampler reshuffles only when told which epoch it
@@ -669,6 +704,13 @@ class PreTrainer:
                 if self.distributed.is_main:
                     self._write_history()
 
+                # Rank 0's validation, rollout eval and checkpoint saves above
+                # are done; beat again before the collective below so a slow
+                # but healthy one of those does not eat into next epoch's
+                # training-batch budget before the watchdog notices progress.
+                if self._watchdog is not None:
+                    self._watchdog.beat()
+
                 # The stop decision is made on rank 0 from a validation pass
                 # only rank 0 ran. Sharing it is not optional: one process
                 # leaving the loop while the others wait in the next collective
@@ -679,6 +721,10 @@ class PreTrainer:
             self.callbacks.on_train_end({"best_epoch": best_epoch, "best": best_metric})
             if self.distributed.is_main:
                 self._write_history()
+            # Stopped here, not left running: a slow publish step after fit()
+            # returns (uploading a checkpoint) is not a stall.
+            if self._watchdog is not None:
+                self._watchdog.stop()
             # Nobody tears down until everybody has finished the loop.
             self.distributed.barrier()
 
