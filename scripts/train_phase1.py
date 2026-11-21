@@ -358,6 +358,24 @@ def main(argv=None) -> int:
             f"[--lr-scale {args.lr_scale}]"
         )
 
+    # Scheduled sampling is opt-in (--ss-max 0 disables it outright). With it
+    # off, nothing ever trains the free running regime, so the default
+    # monitor (val_rollout_total) can only ever get worse and early stopping
+    # would kill the run almost immediately -- see the module docstring on
+    # PreTrainerConfig.monitor. Auto-fall back to plain val_total in that
+    # case, unless the caller explicitly picked a monitor on the command
+    # line, so pure-teacher-forcing runs behave like ordinary pretraining.
+    monitor = args.monitor
+    monitor_start_epoch = args.monitor_start_epoch or None
+    if args.ss_max <= 0.0 and monitor == "val_rollout_total":
+        monitor = "val_total"
+        monitor_start_epoch = 1
+        say(
+            "--ss-max 0.0: scheduled sampling disabled, so monitoring falls "
+            "back to 'val_total' from epoch 1 instead of 'val_rollout_total' "
+            "(pass --monitor explicitly to override this)."
+        )
+
     config = PreTrainerConfig(
         epochs=args.epochs,
         learning_rate=learning_rate,
@@ -371,8 +389,8 @@ def main(argv=None) -> int:
         lr_schedule=args.lr_schedule,
         warmup_epochs=args.warmup_epochs,
         min_lr_factor=args.min_lr_factor,
-        monitor=args.monitor,
-        monitor_start_epoch=args.monitor_start_epoch or None,
+        monitor=monitor,
+        monitor_start_epoch=monitor_start_epoch,
         rollout_eval_batches=args.rollout_eval_batches,
         tensorboard=not args.no_tensorboard,
         progress_every=args.progress_every,

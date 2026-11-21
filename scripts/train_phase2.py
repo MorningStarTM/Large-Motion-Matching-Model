@@ -244,6 +244,20 @@ def main(argv=None) -> int:
             f"lr {args.learning_rate:.2e} -> {learning_rate:.2e} [--lr-scale {args.lr_scale}]"
         )
 
+    # See scripts/train_phase1.py for why: with scheduled sampling off
+    # (--ss-max 0), the default rollout monitor can only get worse, so fall
+    # back to val_total unless the caller picked a monitor explicitly.
+    monitor = args.monitor
+    monitor_start_epoch = args.monitor_start_epoch or None
+    if args.ss_max <= 0.0 and monitor == "val_rollout_total":
+        monitor = "val_total"
+        monitor_start_epoch = 1
+        say(
+            "--ss-max 0.0: scheduled sampling disabled, so monitoring falls "
+            "back to 'val_total' from epoch 1 instead of 'val_rollout_total' "
+            "(pass --monitor explicitly to override this)."
+        )
+
     config = PreTrainerConfig(
         epochs=args.epochs,
         learning_rate=learning_rate,
@@ -257,8 +271,8 @@ def main(argv=None) -> int:
         lr_schedule=args.lr_schedule,
         warmup_epochs=args.warmup_epochs,
         min_lr_factor=args.min_lr_factor,
-        monitor=args.monitor,
-        monitor_start_epoch=args.monitor_start_epoch or None,
+        monitor=monitor,
+        monitor_start_epoch=monitor_start_epoch,
         rollout_eval_batches=args.rollout_eval_batches,
         tensorboard=not args.no_tensorboard,
         progress_every=args.progress_every,
