@@ -50,7 +50,7 @@ from mmm.data.prepare import LOCOMOTION_PATTERN, ensure_database
 from mmm.data.rollout_dataset import RolloutWindowDataset
 from mmm.training.distributed import DistributedContext
 from mmm.training.losses import LossWeights
-from mmm.training.phase2_distill import build_sft_policy
+from mmm.training.phase2_distill import build_policy_for_resume, build_sft_policy
 from mmm.training.pretrainer import PreTrainer, PreTrainerConfig
 from mmm.workspace import Workspace
 
@@ -99,7 +99,11 @@ def parse_args(argv=None):
     paths.add_argument("--run-name", default="phase2")
 
     model = parser.add_argument_group("model")
-    model.add_argument("--phase1-checkpoint", required=True)
+    model.add_argument(
+        "--phase1-checkpoint", default="",
+        help="required to start a fresh SFT/DAgger run; not needed when --resume "
+        "is given, since resuming overwrites every weight it would load anyway",
+    )
 
     windows = parser.add_argument_group("windows")
     windows.add_argument("--window", type=int, default=64)
@@ -226,8 +230,30 @@ def main(argv=None) -> int:
         f"from {len(dataset.source_paths)} rollout file(s)"
     )
 
-    policy, phase1_architecture = build_sft_policy(args.phase1_checkpoint, device="cpu")
-    say(f"policy: {policy.n_parameters():,} parameters (loaded from {args.phase1_checkpoint})")
+    resume = args.resume
+    if resume == "auto":
+        candidate = os.path.join(workspace.out, "last.safetensors")
+        resume = candidate if os.path.exists(candidate) else ""
+        say(f"--resume auto: {'resuming ' + resume if resume else 'nothing to resume from'}")
+
+    if resume:
+        # Resuming overwrites every weight below anyway (PreTrainer.resume
+        # restores weights, optimizer moments and calibration), so there is no
+        # need to also load the Phase 1 checkpoint here -- only its shape
+        # mattered, and the resume checkpoint carries the same shape itself.
+        policy, phase1_architecture = build_policy_for_resume(resume, device="cpu")
+        say(f"policy: {policy.n_parameters():,} parameters (shape read from {resume}, "
+            f"weights will come from --resume)")
+    elif args.phase1_checkpoint:
+        policy, phase1_architecture = build_sft_policy(args.phase1_checkpoint, device="cpu")
+        say(f"policy: {policy.n_parameters():,} parameters (loaded from {args.phase1_checkpoint})")
+    else:
+        print(
+            "error: --phase1-checkpoint is required for a fresh run "
+            "(pass --resume instead if you're continuing one)",
+            file=sys.stderr,
+        )
+        return 1
     for key, value in policy.describe().items():
         say(f"  {key:18} {value}")
 
@@ -285,11 +311,6 @@ def main(argv=None) -> int:
     )
     say(f"device: {trainer.device}")
 
-    resume = args.resume
-    if resume == "auto":
-        candidate = os.path.join(workspace.out, "last.safetensors")
-        resume = candidate if os.path.exists(candidate) else ""
-        say(f"--resume auto: {'resuming ' + resume if resume else 'nothing to resume from'}")
     if resume:
         trainer.resume(resume)
 

@@ -34,17 +34,14 @@ rollouts at once:
     python scripts/train_phase2.py \\
         --dataset data/bvh/bvh \\
         --rollouts runs/rollouts/round1 runs/rollouts/dagger1 \\
-        --phase1-checkpoint runs/phase1/published.safetensors \\
         --resume runs/phase2/best.safetensors \\
         --epochs 10 \\
         --out runs/phase2_round1
 
-`--phase1-checkpoint` is still required on that second command even though
-`--resume` immediately overwrites every weight it produces: `train_phase2.py`
-always performs the Phase 1 handoff first so that a *fresh* run never needs a
-separate code path, and `--resume` is simply what wins when both are given.
-The handoff's own few milliseconds of wasted work is the price of that one
-code path, not a correctness issue.
+`--phase1-checkpoint` is not needed on that second command: with `--resume`
+given, `train_phase2.py` builds the model's shape from the resume
+checkpoint's own manifest instead, since `--resume` overwrites every weight
+anyway. It's only required for a fresh run that has no checkpoint yet.
 """
 
 from __future__ import annotations
