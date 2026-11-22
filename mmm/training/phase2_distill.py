@@ -39,7 +39,50 @@ from mmm.models.runtime import build_policy
 from mmm.training.checkpoints import load_checkpoint, read_metadata
 from mmm.training.pretrainer import PreTrainer, PreTrainerConfig
 
-__all__ = ["build_sft_policy", "build_sft_dataset", "build_sft_trainer"]
+__all__ = ["build_sft_policy", "build_policy_for_resume", "build_sft_dataset", "build_sft_trainer"]
+
+
+def _read_architecture(checkpoint: str) -> dict:
+    import json
+    import os
+
+    manifest_path = os.path.join(os.path.dirname(checkpoint), "manifest.json")
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            architecture = (json.load(handle) or {}).get("architecture")
+    else:
+        architecture = (read_metadata(checkpoint) or {}).get("architecture")
+    if not architecture:
+        raise ValueError(
+            f"no architecture found for {checkpoint}. Looked in "
+            f"{manifest_path} and the checkpoint's own metadata."
+        )
+    return architecture
+
+
+def build_policy_for_resume(resume_checkpoint: str, device: str = "cpu") -> tuple[MmmPolicy, dict]:
+    """A policy shaped to match a Phase 2 checkpoint that will be resumed.
+
+    Used instead of `build_sft_policy` when `--resume` is given: resuming
+    overwrites every weight anyway (`PreTrainer.resume` restores weights,
+    optimizer moments and calibration), so loading the Phase 1 checkpoint's
+    weights first is pure waste -- only its *architecture* ever mattered, and
+    the resume checkpoint carries the same architecture itself (Phase 2 never
+    changes shape; see `build_sft_policy`'s docstring). This lets a resumed
+    SFT or DAgger run skip needing the original Phase 1 checkpoint at all.
+
+    Args:
+        resume_checkpoint: the Phase 2 `.safetensors` file about to be resumed.
+        device: where to put the returned policy. Weights are left at
+            initialisation -- `trainer.resume()` overwrites them immediately
+            after, so loading real weights here would be redundant.
+
+    Returns:
+        `(policy, architecture)`.
+    """
+    architecture = _read_architecture(resume_checkpoint)
+    policy = build_policy(architecture)
+    return policy.to(device), architecture
 
 
 def build_sft_policy(phase1_checkpoint: str, device: str = "cpu") -> tuple[MmmPolicy, dict]:
@@ -63,21 +106,7 @@ def build_sft_policy(phase1_checkpoint: str, device: str = "cpu") -> tuple[MmmPo
     Returns:
         `(policy, architecture)`.
     """
-    import json
-    import os
-
-    manifest_path = os.path.join(os.path.dirname(phase1_checkpoint), "manifest.json")
-    if os.path.isfile(manifest_path):
-        with open(manifest_path, encoding="utf-8") as handle:
-            architecture = (json.load(handle) or {}).get("architecture")
-    else:
-        architecture = (read_metadata(phase1_checkpoint) or {}).get("architecture")
-    if not architecture:
-        raise ValueError(
-            f"no architecture found for {phase1_checkpoint}. Looked in "
-            f"{manifest_path} and the checkpoint's own metadata."
-        )
-
+    architecture = _read_architecture(phase1_checkpoint)
     policy = build_policy(architecture)
     load_checkpoint(phase1_checkpoint, policy=policy, device="cpu", strict=True)
     return policy.to(device), architecture
